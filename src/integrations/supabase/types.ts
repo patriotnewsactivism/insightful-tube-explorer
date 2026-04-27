@@ -14,7 +14,186 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      analyses: {
+        Row: {
+          channel: string | null
+          created_at: string
+          description: string | null
+          error_message: string | null
+          expanded_notes: string | null
+          id: string
+          likely_production_date: string | null
+          polished_transcript: string | null
+          production_date_reasoning: string | null
+          published_at: string | null
+          raw_transcript: Json | null
+          sentiment: Json | null
+          status: Database["public"]["Enums"]["analysis_status"]
+          summary: string | null
+          thumbnail_url: string | null
+          title: string | null
+          updated_at: string
+          user_id: string
+          youtube_id: string | null
+          youtube_url: string
+        }
+        Insert: {
+          channel?: string | null
+          created_at?: string
+          description?: string | null
+          error_message?: string | null
+          expanded_notes?: string | null
+          id?: string
+          likely_production_date?: string | null
+          polished_transcript?: string | null
+          production_date_reasoning?: string | null
+          published_at?: string | null
+          raw_transcript?: Json | null
+          sentiment?: Json | null
+          status?: Database["public"]["Enums"]["analysis_status"]
+          summary?: string | null
+          thumbnail_url?: string | null
+          title?: string | null
+          updated_at?: string
+          user_id: string
+          youtube_id?: string | null
+          youtube_url: string
+        }
+        Update: {
+          channel?: string | null
+          created_at?: string
+          description?: string | null
+          error_message?: string | null
+          expanded_notes?: string | null
+          id?: string
+          likely_production_date?: string | null
+          polished_transcript?: string | null
+          production_date_reasoning?: string | null
+          published_at?: string | null
+          raw_transcript?: Json | null
+          sentiment?: Json | null
+          status?: Database["public"]["Enums"]["analysis_status"]
+          summary?: string | null
+          thumbnail_url?: string | null
+          title?: string | null
+          updated_at?: string
+          user_id?: string
+          youtube_id?: string | null
+          youtube_url?: string
+        }
+        Relationships: []
+      }
+      profiles: {
+        Row: {
+          avatar_url: string | null
+          created_at: string
+          display_name: string | null
+          id: string
+          updated_at: string
+        }
+        Insert: {
+          avatar_url?: string | null
+          created_at?: string
+          display_name?: string | null
+          id: string
+          updated_at?: string
+        }
+        Update: {
+          avatar_url?: string | null
+          created_at?: string
+          display_name?: string | null
+          id?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      speaker_utterances: {
+        Row: {
+          analysis_id: string
+          created_at: string
+          diarization_label: string | null
+          end_seconds: number | null
+          id: string
+          speaker_id: string | null
+          start_seconds: number | null
+          text: string
+          user_id: string
+        }
+        Insert: {
+          analysis_id: string
+          created_at?: string
+          diarization_label?: string | null
+          end_seconds?: number | null
+          id?: string
+          speaker_id?: string | null
+          start_seconds?: number | null
+          text: string
+          user_id: string
+        }
+        Update: {
+          analysis_id?: string
+          created_at?: string
+          diarization_label?: string | null
+          end_seconds?: number | null
+          id?: string
+          speaker_id?: string | null
+          start_seconds?: number | null
+          text?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "speaker_utterances_analysis_id_fkey"
+            columns: ["analysis_id"]
+            isOneToOne: false
+            referencedRelation: "analyses"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "speaker_utterances_speaker_id_fkey"
+            columns: ["speaker_id"]
+            isOneToOne: false
+            referencedRelation: "speakers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      speakers: {
+        Row: {
+          azure_profile_id: string | null
+          channel: string | null
+          created_at: string
+          id: string
+          name: string
+          notes: string | null
+          updated_at: string
+          user_id: string
+          voice_embedding: Json | null
+        }
+        Insert: {
+          azure_profile_id?: string | null
+          channel?: string | null
+          created_at?: string
+          id?: string
+          name: string
+          notes?: string | null
+          updated_at?: string
+          user_id: string
+          voice_embedding?: Json | null
+        }
+        Update: {
+          azure_profile_id?: string | null
+          channel?: string | null
+          created_at?: string
+          id?: string
+          name?: string
+          notes?: string | null
+          updated_at?: string
+          user_id?: string
+          voice_embedding?: Json | null
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
@@ -23,7 +202,13 @@ export type Database = {
       [_ in never]: never
     }
     Enums: {
-      [_ in never]: never
+      analysis_status:
+        | "pending"
+        | "extracting"
+        | "transcribing"
+        | "processing"
+        | "complete"
+        | "failed"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -150,6 +335,15 @@ export type CompositeTypes<
 
 export const Constants = {
   public: {
-    Enums: {},
+    Enums: {
+      analysis_status: [
+        "pending",
+        "extracting",
+        "transcribing",
+        "processing",
+        "complete",
+        "failed",
+      ],
+    },
   },
 } as const
