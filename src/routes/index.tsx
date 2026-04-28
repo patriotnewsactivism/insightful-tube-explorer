@@ -74,7 +74,7 @@ function Landing() {
             </Button>
           </div>
           <p className="mt-3 text-xs text-muted-foreground">
-            3 free analyses · No credit card required
+            3 free analyses &middot; No credit card required
           </p>
         </section>
 
