@@ -1,1 +1,5 @@
-W3BoYXNlcy5zZXR1cF0Kbml4UGtncyA9IFsicHl0aG9uMzExIiwgImZmbXBlZyIsICJ5dC1kbHAiXQoKW3N0YXJ0XQpjbWQgPSAicHl0aG9uMy4xMSBtYWluLnB5Igo=
+[phases.setup]
+nixPkgs = ["python311", "ffmpeg", "yt-dlp"]
+
+[start]
+cmd = "python3.11 main.py"
