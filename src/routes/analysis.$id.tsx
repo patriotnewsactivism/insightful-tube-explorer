@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate, Link } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 import { SiteHeader } from "@/components/SiteHeader";
@@ -39,6 +39,22 @@ type Utterance = {
 
 const STATUS_STEPS = ["pending", "extracting", "transcribing", "processing", "complete"];
 
+const STATUS_RANGES: Record<string, [number, number]> = {
+  pending:      [0, 8],
+  extracting:   [8, 32],
+  transcribing: [32, 68],
+  processing:   [68, 94],
+  complete:     [100, 100],
+  failed:       [0, 0],
+};
+
+const STAGE_DURATION: Record<string, number> = {
+  pending: 5,
+  extracting: 20,
+  transcribing: 40,
+  processing: 15,
+};
+
 function formatSeconds(s: number | null): string {
   if (s == null) return "";
   const m = Math.floor(s / 60);
@@ -58,24 +74,92 @@ function StatusBadge({ status }: { status: string }) {
   return <Badge variant={(variants[status] ?? "secondary") as any} className="capitalize">{status}</Badge>;
 }
 
-function ProgressBar({ status }: { status: string }) {
+function NumericalProgressBar({ status }: { status: string }) {
+  const [progress, setProgress] = useState(0);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const statusRef = useRef(status);
+
+  useEffect(() => {
+    statusRef.current = status;
+
+    if (status === "complete") {
+      setProgress(100);
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      return;
+    }
+    if (status === "failed") {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      return;
+    }
+
+    const range = STATUS_RANGES[status] ?? [0, 10];
+    const duration = STAGE_DURATION[status] ?? 10;
+    const [min, max] = range;
+
+    setProgress((prev) => Math.max(prev, min));
+
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    const tickMs = 500;
+    const totalTicks = (duration * 1000) / tickMs;
+    const increment = (max - min) / totalTicks;
+
+    intervalRef.current = setInterval(() => {
+      setProgress((prev) => {
+        const currentRange = STATUS_RANGES[statusRef.current] ?? [0, 10];
+        const ceiling = currentRange[1];
+        const next = prev + increment * (0.5 + Math.random() * 0.8);
+        return Math.min(next, ceiling);
+      });
+    }, tickMs);
+
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [status]);
+
   if (status === "complete" || status === "failed") return null;
-  const idx = STATUS_STEPS.indexOf(status);
-  const pct = idx < 0 ? 5 : Math.round(((idx + 1) / STATUS_STEPS.length) * 100);
+
+  const displayPct = Math.round(progress);
+
   const labels: Record<string, string> = {
-    pending: "Queued...",
-    extracting: "Downloading audio...",
-    transcribing: "Transcribing with Azure Speech...",
+    pending: "Queued \u2014 waiting for worker...",
+    extracting: "Downloading audio from YouTube...",
+    transcribing: "Transcribing with Azure Speech AI...",
     processing: "Generating insights with Azure OpenAI...",
   };
+
   return (
     <div className="rounded-xl border border-border bg-surface/40 p-6">
-      <div className="flex items-center gap-2 mb-3">
-        <Loader2 className="h-4 w-4 animate-spin text-primary" />
-        <span className="text-sm font-medium">{labels[status] ?? "Processing..."}</span>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Loader2 className="h-4 w-4 animate-spin text-primary" />
+          <span className="text-sm font-medium">{labels[status] ?? "Processing..."}</span>
+        </div>
+        <span className="text-2xl font-bold tabular-nums text-primary">{displayPct}%</span>
       </div>
-      <div className="w-full bg-muted rounded-full h-2">
-        <div className="bg-primary h-2 rounded-full transition-all duration-700" style={{ width: `${pct}%` }} />
+      <div className="w-full bg-muted rounded-full h-3 overflow-hidden">
+        <div
+          className="bg-gradient-to-r from-primary to-primary/80 h-3 rounded-full transition-all duration-500 ease-out relative"
+          style={{ width: `${displayPct}%` }}
+        >
+          <div className="absolute inset-0 bg-white/20 animate-pulse rounded-full" />
+        </div>
+      </div>
+      <div className="flex justify-between mt-2">
+        {STATUS_STEPS.slice(0, -1).map((step, i) => {
+          const isActive = status === step;
+          const isDone = STATUS_STEPS.indexOf(status) > i;
+          return (
+            <span
+              key={step}
+              className={`text-xs capitalize transition-colors ${
+                isActive ? "text-primary font-medium" : isDone ? "text-muted-foreground" : "text-muted-foreground/40"
+              }`}
+            >
+              {isDone ? "\u2713 " : ""}{step}
+            </span>
+          );
+        })}
       </div>
     </div>
   );
@@ -101,7 +185,6 @@ function AnalysisPage() {
       else setA(data as Analysis);
     })();
 
-    // Realtime subscription for status updates
     const channel = supabase
       .channel(`analysis:${id}`)
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "analyses", filter: `id=eq.${id}` }, (payload) => {
@@ -173,14 +256,12 @@ function AnalysisPage() {
           </div>
         )}
 
-        {/* Progress bar while processing */}
         {a.status !== "complete" && a.status !== "failed" && (
           <div className="mb-6">
-            <ProgressBar status={a.status} />
+            <NumericalProgressBar status={a.status} />
           </div>
         )}
 
-        {/* Error state */}
         {a.status === "failed" && (
           <div className="rounded-xl border border-destructive/40 bg-destructive/10 p-6 mb-6 flex gap-3">
             <AlertCircle className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
@@ -191,7 +272,6 @@ function AnalysisPage() {
           </div>
         )}
 
-        {/* Production date estimate */}
         {a.likely_production_date && (
           <div className="rounded-xl border border-border bg-surface/40 p-4 mb-6 flex gap-3 items-start">
             <Calendar className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
@@ -205,7 +285,6 @@ function AnalysisPage() {
           </div>
         )}
 
-        {/* Tabs — only show when complete */}
         {a.status === "complete" && (
           <>
             <div className="flex gap-1 border-b border-border mb-6">
@@ -225,7 +304,6 @@ function AnalysisPage() {
               ))}
             </div>
 
-            {/* Summary */}
             {activeTab === "summary" && (
               <div className="rounded-xl border border-border bg-surface/40 p-6">
                 <h2 className="font-display text-lg font-semibold mb-3">Summary</h2>
@@ -233,7 +311,6 @@ function AnalysisPage() {
               </div>
             )}
 
-            {/* Transcript with diarization */}
             {activeTab === "transcript" && (
               <div className="rounded-xl border border-border bg-surface/40 p-6">
                 <h2 className="font-display text-lg font-semibold mb-4">Speaker Transcript</h2>
@@ -263,7 +340,6 @@ function AnalysisPage() {
               </div>
             )}
 
-            {/* Expanded notes */}
             {activeTab === "notes" && (
               <div className="rounded-xl border border-border bg-surface/40 p-6">
                 <h2 className="font-display text-lg font-semibold mb-3">Expanded Notes</h2>
@@ -273,7 +349,6 @@ function AnalysisPage() {
               </div>
             )}
 
-            {/* Sentiment */}
             {activeTab === "sentiment" && (
               <div className="rounded-xl border border-border bg-surface/40 p-6">
                 <h2 className="font-display text-lg font-semibold mb-4">Sentiment Analysis</h2>
