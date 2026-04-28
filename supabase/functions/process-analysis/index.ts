@@ -16,6 +16,38 @@ const AZURE_OPENAI_API_KEY = Deno.env.get("AZURE_OPENAI_API_KEY")!;
 const AZURE_OPENAI_DEPLOYMENT = Deno.env.get("AZURE_OPENAI_DEPLOYMENT") ?? "gpt-5-mini";
 
 // ---------------------------------------------------------------------------
+// YouTube URL → Video ID extraction (mirrors src/lib/youtube.ts)
+// ---------------------------------------------------------------------------
+function extractYouTubeId(url: string): string | null {
+  const trimmed = url.trim();
+  if (/^[A-Za-z0-9_-]{11}$/.test(trimmed)) return trimmed;
+  try {
+    const u = new URL(trimmed);
+    if (u.hostname === "youtu.be") {
+      const id = u.pathname.slice(1).split("/")[0];
+      return id || null;
+    }
+    if (u.hostname.includes("youtube.com") || u.hostname.includes("youtube-nocookie.com")) {
+      if (u.pathname === "/watch" || u.pathname === "/watch/") return u.searchParams.get("v");
+      for (const prefix of ["/embed/", "/shorts/", "/live/", "/v/", "/e/"]) {
+        if (u.pathname.startsWith(prefix)) {
+          const id = u.pathname.slice(prefix.length).split(/[/?]/)[0];
+          return id || null;
+        }
+      }
+      const vParam = u.searchParams.get("v");
+      if (vParam) return vParam;
+    }
+    return null;
+  } catch {
+    const match = trimmed.match(
+      /(?:youtu\.be\/|youtube\.com\/(?:watch\?.*v=|embed\/|shorts\/|live\/|v\/|e\/))([A-Za-z0-9_-]{11})/
+    );
+    return match?.[1] ?? null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -258,12 +290,22 @@ Deno.serve(async (req) => {
   try { payload = await req.json(); } catch { return new Response("Invalid JSON", { status: 400 }); }
 
   const record = payload?.record ?? payload;
-  const { id: analysisId, youtube_url: youtubeUrl, title, user_id, status } = record ?? {};
+  const { id: analysisId, youtube_url: youtubeUrl, youtube_id: existingYtId, title, user_id, status, pasted_transcript: pastedTranscript } = record ?? {};
 
   if (!analysisId || !youtubeUrl) return new Response("Missing id or youtube_url", { status: 400 });
   if (status && status !== "pending") return new Response("Not pending, skipping", { status: 200 });
 
-  console.log(`[process-analysis] Starting pipeline for ${analysisId}`);
+  // Resolve the video ID — use existing if present, otherwise extract from URL
+  const videoId = existingYtId || extractYouTubeId(youtubeUrl);
+  if (!videoId) {
+    await fail(analysisId, `Could not extract video ID from URL: ${youtubeUrl.slice(0, 80)}. Supported formats: youtube.com/watch?v=, youtu.be/, /shorts/, /live/, /embed/.`);
+    return new Response(JSON.stringify({ ok: false, error: "Invalid YouTube URL" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  console.log(`[process-analysis] Starting pipeline for ${analysisId} (video: ${videoId})`);
 
   (async () => {
     const tmpDir = await Deno.makeTempDir();
@@ -271,6 +313,29 @@ Deno.serve(async (req) => {
     const blobName = `${analysisId}.mp3`;
 
     try {
+      // If a pasted transcript was provided (or client-side transcript was grabbed),
+      // skip audio extraction and go straight to AI analysis.
+      if (pastedTranscript && typeof pastedTranscript === "string" && pastedTranscript.trim().length > 50) {
+        console.log(`[${analysisId}] Using pasted/client transcript (${pastedTranscript.length} chars), skipping audio pipeline`);
+        await setStatus(analysisId, "processing");
+
+        const insights = await generateInsights(pastedTranscript.trim(), title ?? null);
+
+        await sb().from("analyses").update({
+          status: "complete",
+          polished_transcript: pastedTranscript.trim(),
+          summary: insights.summary,
+          sentiment: insights.sentiment,
+          expanded_notes: insights.expandedNotes,
+          likely_production_date: insights.likelyProductionDate,
+          production_date_reasoning: insights.productionDateReasoning,
+        }).eq("id", analysisId);
+
+        console.log(`[${analysisId}] Pipeline complete (pasted transcript) ✓`);
+        return;
+      }
+
+      // Full audio pipeline: download → upload → transcribe → analyze
       await setStatus(analysisId, "extracting");
       await downloadAudio(youtubeUrl, audioPath);
 
