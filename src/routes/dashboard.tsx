@@ -10,7 +10,7 @@ import { toast } from "sonner";
 import {
   Plus, Loader2, Play, ClipboardPaste, ChevronDown, ChevronUp,
   Zap, List, Search, BookOpen, Users, Filter, CheckCircle2, XCircle, Clock,
-  Calendar, Quote, AlertTriangle
+  Calendar, Quote, AlertTriangle, BookMarked
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 
@@ -207,6 +207,16 @@ function Dashboard() {
             <Button asChild variant="outline" size="sm">
               <Link to="/contradictions">
                 <AlertTriangle className="h-3.5 w-3.5 mr-1" /> Contradictions
+              </Link>
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              <Link to="/people">
+                <Users className="h-3.5 w-3.5 mr-1" /> People Index
+              </Link>
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              <Link to="/chapters">
+                <BookMarked className="h-3.5 w-3.5 mr-1" /> Chapters
               </Link>
             </Button>
           </div>
