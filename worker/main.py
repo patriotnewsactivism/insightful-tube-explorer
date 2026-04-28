@@ -599,6 +599,13 @@ def run_pipeline(record):
                 used_source = "YouTube captions"
             else:
                 # ── TRACK 2: yt-dlp + Azure Speech ──
+                # Without cookies, yt-dlp will also be blocked. Fail with helpful message.
+                if not YOUTUBE_COOKIES_B64 and not os.path.exists(COOKIES_PATH):
+                    fail_analysis(analysis_id,
+                        "YouTube blocks server access. Please use the 'Paste transcript manually' "
+                        "option on the dashboard: on the YouTube video tap ⋯ → Show transcript → "
+                        "copy the text → paste it into TubeScribe.")
+                    return
                 print("[worker] No YouTube transcript, trying yt-dlp download...")
 
                 with tempfile.TemporaryDirectory() as tmp:
