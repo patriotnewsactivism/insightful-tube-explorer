@@ -6,6 +6,7 @@ Pipeline: Pasted transcript → Supadata API → YouTube captions fallback
 v6: Supadata API integration
 v7: Speaker ID, polished transcript, AI chat, export
 v8: Fact extraction, entity extraction, cross-video search, bulk support
+v8.1: Quote extraction, timeline builder, contradiction detector
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -754,13 +755,14 @@ def run_pipeline(record):
             for i in range(0, len(rows), 500):
                 sb_insert("speaker_utterances", rows[i:i+500])
 
-        # ── Extract facts & entities (async, after completion) ──
+        # ── Extract facts, entities, quotes, timeline, contradictions (async) ──
         import threading as _th
-        _th.Thread(
-            target=extract_facts_and_entities,
-            args=(analysis_id, user_id, title, polished, description),
-            daemon=True,
-        ).start()
+        def _post_pipeline():
+            extract_facts_and_entities(analysis_id, user_id, title, polished, description)
+            extract_quotes_and_timeline(analysis_id, user_id, title, polished, description)
+            detect_contradictions(analysis_id, user_id, title, polished)
+            print(f"[worker] Post-pipeline enrichment complete for {analysis_id}")
+        _th.Thread(target=_post_pipeline, daemon=True).start()
 
         total = time.time() - t_start
         print(f"[worker] ✅ Complete in {total:.1f}s ({used_source}) for {analysis_id}")
@@ -953,6 +955,187 @@ def save_entities(user_id, analysis_id, raw_entities):
         print(f"[worker] Processed {len(raw_entities)} entities for {analysis_id}")
     except Exception as e:
         print(f"[worker] Entity save error: {e}")
+
+
+# ── Quote & Timeline Extraction ───────────────────────────────────────────────
+def extract_quotes_and_timeline(analysis_id, user_id, title, transcript, description=""):
+    """Extract notable quotes and timeline events from a completed analysis."""
+    ctx = f'Video title: "{title}"\n' if title else ""
+    if description:
+        ctx += f'Description: "{description[:500]}"\n'
+    t = transcript[:14000]
+
+    prompts = [
+        # Quote extraction
+        (f'''Extract ALL notable direct quotes from this transcript. Focus on:
+- Statements that could be evidence in a legal/injustice context
+- Admissions, denials, threats, promises
+- Key testimony or witness statements
+- Powerful/emotional statements
+- Anything quotable for a book
+
+Return ONLY valid JSON (no markdown): {{"quotes": [
+  {{"speaker": "speaker name or identifier", "quote_text": "exact or near-exact quote", "context": "what was happening when this was said", "timestamp_hint": "approximate time or null", "significance": "high|medium|low", "tags": ["evidence", "testimony", "threat", "admission", "denial", "emotional", "legal"]}}
+]}}
+
+Be thorough — a book author needs every usable quote.''',
+         f"{ctx}Transcript:\n{t}"),
+
+        # Timeline extraction
+        (f'''Extract ALL dates, time references, and chronological events mentioned in this transcript.
+Include:
+- Specific dates mentioned (filing dates, incident dates, meeting dates)
+- Relative time references ("last week", "three months ago") — estimate the actual date if possible
+- Sequence of events described
+- Deadlines mentioned
+
+Return ONLY valid JSON (no markdown): {{"events": [
+  {{"event_date": "YYYY-MM-DD or YYYY-MM or YYYY (best estimate)", "precision": "exact|month|year|estimated", "description": "what happened", "source_context": "the quote or context that mentions this date", "category": "filing|hearing|incident|deadline|arrest|ruling|other", "confidence": "high|medium|low"}}
+]}}
+
+Use context clues to estimate dates. If the video was likely recorded around a certain date, use that to resolve relative references.''',
+         f"{ctx}Transcript:\n{t}"),
+    ]
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(call_openai, p[0], p[1], 4000) for p in prompts]
+            quotes_raw, timeline_raw = [f.result() for f in futures]
+
+        # Parse and save quotes
+        quotes = []
+        try:
+            m = re.search(r"\{[\s\S]*\}", quotes_raw)
+            if m:
+                quotes = json.loads(m.group()).get("quotes", [])
+        except Exception as e:
+            print(f"[worker] Quotes parse error: {e}")
+
+        if quotes:
+            rows = []
+            for q in quotes:
+                ts = None
+                hint = q.get("timestamp_hint")
+                if hint and isinstance(hint, str):
+                    ts_m = re.match(r'(\d+):(\d+)', hint)
+                    if ts_m:
+                        ts = int(ts_m.group(1)) * 60 + int(ts_m.group(2))
+                rows.append({
+                    "user_id": user_id,
+                    "analysis_id": analysis_id,
+                    "speaker": (q.get("speaker") or "Unknown")[:200],
+                    "quote_text": (q.get("quote_text") or "")[:2000],
+                    "context": (q.get("context") or "")[:500],
+                    "timestamp_seconds": ts,
+                    "significance": q.get("significance", "medium"),
+                    "tags": q.get("tags", []),
+                })
+            for i in range(0, len(rows), 50):
+                sb_insert("quotes", rows[i:i+50])
+            print(f"[worker] Saved {len(rows)} quotes for {analysis_id}")
+
+        # Parse and save timeline events
+        events = []
+        try:
+            m = re.search(r"\{[\s\S]*\}", timeline_raw)
+            if m:
+                events = json.loads(m.group()).get("events", [])
+        except Exception as e:
+            print(f"[worker] Timeline parse error: {e}")
+
+        if events:
+            rows = []
+            for ev in events:
+                rows.append({
+                    "user_id": user_id,
+                    "analysis_id": analysis_id,
+                    "event_date": (ev.get("event_date") or "unknown")[:50],
+                    "event_date_precision": ev.get("precision", "estimated"),
+                    "event_description": (ev.get("description") or "")[:1000],
+                    "source_context": (ev.get("source_context") or "")[:500],
+                    "category": ev.get("category", "event"),
+                    "confidence": ev.get("confidence", "medium"),
+                })
+            for i in range(0, len(rows), 50):
+                sb_insert("timeline_events", rows[i:i+50])
+            print(f"[worker] Saved {len(rows)} timeline events for {analysis_id}")
+
+    except Exception as e:
+        print(f"[worker] Quote/timeline extraction error: {e}")
+
+
+def detect_contradictions(analysis_id, user_id, title, transcript):
+    """Compare new analysis against existing facts to find contradictions."""
+    try:
+        # Get existing facts for this user
+        url = f"{SUPABASE_URL}/rest/v1/facts?user_id=eq.{user_id}&select=claim,category,analysis_id,citation&limit=200"
+        req = Request(url, headers={**sb_headers(), "Prefer": ""})
+        existing_facts = json.loads(urlopen(req).read())
+
+        # Filter out facts from current analysis
+        other_facts = [f for f in existing_facts if f["analysis_id"] != analysis_id]
+        if not other_facts:
+            print(f"[worker] No prior facts to compare for contradiction detection")
+            return
+
+        # Build fact summary for comparison
+        fact_lines = []
+        for f in other_facts[:100]:
+            fact_lines.append(f"[{f['analysis_id'][:8]}] ({f.get('category','')}) {f['claim']}")
+        fact_block = "\n".join(fact_lines)
+
+        prompt = f'''Compare the claims in this NEW video against EXISTING facts from other videos by the same user.
+Identify any contradictions, inconsistencies, or conflicting accounts.
+
+EXISTING FACTS:
+{fact_block[:6000]}
+
+NEW VIDEO: "{title}"
+{transcript[:6000]}
+
+Return ONLY valid JSON (no markdown): {{"contradictions": [
+  {{"claim_a": "the existing fact that conflicts", "claim_a_source_id": "the 8-char analysis ID prefix from brackets", "claim_b": "the contradicting claim from this new video", "explanation": "why these conflict", "severity": "high|medium|low"}}
+]}}
+
+If no contradictions found, return {{"contradictions": []}}.
+Only flag genuine contradictions or inconsistencies, not minor differences in wording.'''
+
+        response = call_openai(prompt, "", 3000)
+        contradictions = []
+        try:
+            m = re.search(r"\{[\s\S]*\}", response)
+            if m:
+                contradictions = json.loads(m.group()).get("contradictions", [])
+        except Exception as e:
+            print(f"[worker] Contradictions parse error: {e}")
+
+        if contradictions:
+            rows = []
+            # Build lookup for full analysis IDs
+            id_prefix_map = {}
+            for f in other_facts:
+                id_prefix_map[f["analysis_id"][:8]] = f["analysis_id"]
+
+            for c in contradictions:
+                src_prefix = c.get("claim_a_source_id", "")
+                claim_a_id = id_prefix_map.get(src_prefix, other_facts[0]["analysis_id"] if other_facts else analysis_id)
+                rows.append({
+                    "user_id": user_id,
+                    "claim_a_analysis_id": claim_a_id,
+                    "claim_b_analysis_id": analysis_id,
+                    "claim_a": (c.get("claim_a") or "")[:2000],
+                    "claim_b": (c.get("claim_b") or "")[:2000],
+                    "explanation": (c.get("explanation") or "")[:1000],
+                    "severity": c.get("severity", "medium"),
+                })
+            if rows:
+                sb_insert("contradictions", rows)
+                print(f"[worker] Found {len(rows)} contradictions for {analysis_id}")
+        else:
+            print(f"[worker] No contradictions found for {analysis_id}")
+
+    except Exception as e:
+        print(f"[worker] Contradiction detection error: {e}")
 
 
 # ── Cross-Video Search ────────────────────────────────────────────────────────

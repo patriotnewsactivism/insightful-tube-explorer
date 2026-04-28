@@ -9,7 +9,8 @@ import { extractYouTubeId, fetchYouTubeOEmbed, fetchClientTranscript } from "@/l
 import { toast } from "sonner";
 import {
   Plus, Loader2, Play, ClipboardPaste, ChevronDown, ChevronUp,
-  Zap, List, Search, BookOpen, Users, Filter, CheckCircle2, XCircle, Clock
+  Zap, List, Search, BookOpen, Users, Filter, CheckCircle2, XCircle, Clock,
+  Calendar, Quote, AlertTriangle
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 
@@ -187,10 +188,25 @@ function Dashboard() {
               {counts.pending > 0 && ` · ${counts.pending} processing`}
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button asChild variant="outline" size="sm">
               <Link to="/knowledge">
                 <BookOpen className="h-3.5 w-3.5 mr-1" /> Knowledge Base
+              </Link>
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              <Link to="/timeline">
+                <Calendar className="h-3.5 w-3.5 mr-1" /> Timeline
+              </Link>
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              <Link to="/quotes">
+                <Quote className="h-3.5 w-3.5 mr-1" /> Quotes
+              </Link>
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              <Link to="/contradictions">
+                <AlertTriangle className="h-3.5 w-3.5 mr-1" /> Contradictions
               </Link>
             </Button>
           </div>
