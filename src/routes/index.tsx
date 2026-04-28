@@ -1,4 +1,4 @@
-import { createFileRoute, Link, redirect } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { SiteHeader } from "@/components/SiteHeader";
 import { Button } from "@/components/ui/button";
 import { ArrowRight, Mic, FileText, Users, Download, Sparkles, Clock } from "lucide-react";
@@ -16,7 +16,7 @@ function Landing() {
         <section className="py-24 md:py-32 text-center">
           <div className="inline-flex items-center gap-2 rounded-full border border-border bg-surface/60 px-3 py-1 text-xs text-muted-foreground mb-8">
             <Sparkles className="h-3 w-3 text-primary" />
-            Powered by Azure AI Speech + Lovable AI
+            AI-Powered Video Intelligence
           </div>
           <h1 className="font-display text-5xl md:text-7xl font-semibold leading-[1.05] tracking-tight">
             Read between<br />
@@ -37,12 +37,12 @@ function Landing() {
         {/* Features */}
         <section className="pb-24 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {[
-            { icon: Mic, title: "Diarized transcript", body: "Azure Speech identifies each speaker, gently polished for readability without losing voice." },
-            { icon: FileText, title: "Summary & sentiment", body: "Concise executive summary plus section-level sentiment you can skim." },
-            { icon: Users, title: "Speaker memory", body: "Voice embeddings remember speakers across videos. Never re-label the same person twice." },
-            { icon: Clock, title: "Production date", body: "AI infers the likely production date from title, description, and transcript clues." },
+            { icon: Mic, title: "Diarized transcript", body: "Each speaker is identified and labeled, gently polished for readability without losing voice." },
+            { icon: FileText, title: "Summary & sentiment", body: "Concise executive summary plus section-level sentiment you can skim in seconds." },
+            { icon: Users, title: "Speaker memory", body: "Voice profiles remember speakers across videos. Never re-label the same person twice." },
+            { icon: Clock, title: "Production date", body: "AI infers the likely recording date from title, description, and transcript clues." },
             { icon: Sparkles, title: "Expand on demand", body: "Generate deeper notes, study guides, or briefings from any section, anytime." },
-            { icon: Download, title: "Export anywhere", body: "Markdown, PDF, or plain text. Autosaved so nothing is ever lost." },
+            { icon: Download, title: "Export anywhere", body: "PDF, Word, Markdown, or plain text. Autosaved so nothing is ever lost." },
           ].map((f) => (
             <div key={f.title} className="rounded-xl border border-border bg-surface/40 p-6 hover:bg-surface/70 transition-colors">
               <f.icon className="h-5 w-5 text-primary mb-4" />
@@ -51,6 +51,11 @@ function Landing() {
             </div>
           ))}
         </section>
+
+        {/* Footer */}
+        <footer className="border-t border-border/60 py-8 text-center text-xs text-muted-foreground">
+          &copy; {new Date().getFullYear()} Lumen. All rights reserved.
+        </footer>
       </main>
     </div>
   );
