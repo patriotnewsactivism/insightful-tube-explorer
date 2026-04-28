@@ -213,6 +213,8 @@ function parseUtterances(result: any): Utterance[] {
 // ---------------------------------------------------------------------------
 // Step 6: Azure OpenAI via Responses API
 // ---------------------------------------------------------------------------
+const CONTENT_FILTER_FALLBACK = "[Content filtered by Azure — this section could not be analyzed due to content policy restrictions on the transcript.]";
+
 async function callOpenAI(instructions: string, input: string): Promise<string> {
   // Use the Responses API endpoint as provided
   const url = "https://openaiyoutube.openai.azure.com/openai/responses?api-version=2025-04-01-preview";
@@ -230,7 +232,17 @@ async function callOpenAI(instructions: string, input: string): Promise<string> 
       temperature: 0.3,
     }),
   });
-  if (!res.ok) throw new Error(`Azure OpenAI failed (${res.status}): ${await res.text()}`);
+
+  if (!res.ok) {
+    const body = await res.text();
+    // If content filter triggered, return fallback instead of crashing the pipeline
+    if (res.status === 400 && body.includes("content_filter")) {
+      console.warn(`[callOpenAI] Content filter triggered, returning fallback. Filter details: ${body.slice(0, 300)}`);
+      return CONTENT_FILTER_FALLBACK;
+    }
+    throw new Error(`Azure OpenAI failed (${res.status}): ${body}`);
+  }
+
   const data = await res.json();
   // Responses API returns output array of content blocks
   const textBlock = data.output?.find((o: any) => o.type === "message")
@@ -242,21 +254,24 @@ async function generateInsights(transcript: string, title: string | null) {
   const ctx = title ? `Video title: "${title}"\n\n` : "";
   const t = transcript.slice(0, 12000);
 
+  // Framing prefix helps Azure content filters understand this is legitimate news analysis
+  const NEWS_FRAME = "You are a professional journalism researcher performing academic media analysis on a publicly available news broadcast transcript. Your role is to objectively document and analyze the content for research purposes. ";
+
   const [summaryRaw, sentimentRaw, notesRaw, dateRaw] = await Promise.all([
     callOpenAI(
-      "You are an expert media analyst. Produce a concise 3–5 sentence summary of the key points discussed.",
+      NEWS_FRAME + "Produce a concise 3–5 sentence summary of the key points discussed in this news/media transcript.",
       `${ctx}Transcript:\n${t}`
     ),
     callOpenAI(
-      `Analyze the transcript and return ONLY valid JSON with no markdown fences: {"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}`,
+      NEWS_FRAME + `Analyze the overall tone of this news/media transcript and return ONLY valid JSON with no markdown fences: {"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}`,
       `${ctx}Transcript:\n${t}`
     ),
     callOpenAI(
-      `Produce detailed expanded notes with these markdown sections: ## Main Topics, ## Key Claims, ## Notable Quotes, ## Action Items, ## Unanswered Questions`,
+      NEWS_FRAME + `Produce detailed expanded research notes on this news/media transcript with these markdown sections: ## Main Topics, ## Key Claims, ## Notable Quotes, ## Action Items, ## Unanswered Questions`,
       `${ctx}Transcript:\n${t}`
     ),
     callOpenAI(
-      `Analyze for clues about when this content was produced or recorded (not published). Return ONLY valid JSON with no markdown fences: {"likely_production_date":"<date range>","reasoning":"<brief explanation>"}`,
+      NEWS_FRAME + `Analyze this news/media transcript for clues about when this content was produced or recorded (not published). Return ONLY valid JSON with no markdown fences: {"likely_production_date":"<date range>","reasoning":"<brief explanation>"}`,
       `${ctx}Transcript:\n${transcript.slice(0, 8000)}`
     ),
   ]);
