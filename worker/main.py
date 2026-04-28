@@ -1,9 +1,9 @@
 """
-insightful-tube-explorer: Audio Worker v5
-Handles: Pasted transcript → YouTube transcript (with cookies) → yt-dlp fallback
-         → Azure Speech fast transcription → Azure OpenAI insights (parallel)
+TubeScribe: Audio Worker v6
+Pipeline: Pasted transcript → Supadata API → YouTube captions fallback
+         → Azure OpenAI insights (parallel)
 
-v5: Paste-to-analyze mode — accepts pasted_transcript field to bypass YouTube entirely
+v6: Supadata API integration — bypasses YouTube bot detection entirely
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -19,41 +19,16 @@ from concurrent.futures import ThreadPoolExecutor
 SUPABASE_URL             = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 AZURE_SPEECH_ENDPOINT    = os.environ.get("AZURE_SPEECH_ENDPOINT", "https://eastus.api.cognitive.microsoft.com/")
-AZURE_SPEECH_KEY         = os.environ["AZURE_SPEECH_API_KEY"]
-AZURE_STORAGE_CONN       = os.environ["AZURE_STORAGE_CONNECTION_STRING"]
+AZURE_SPEECH_KEY         = os.environ.get("AZURE_SPEECH_API_KEY", "")
+AZURE_STORAGE_CONN       = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
 AZURE_STORAGE_ACCOUNT    = "wtptranscriptionstorage"
 AZURE_STORAGE_CONTAINER  = "transcriptions"
 AZURE_OPENAI_KEY         = os.environ["AZURE_OPENAI_API_KEY"]
 AZURE_OPENAI_DEPLOYMENT  = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
+SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
-YOUTUBE_COOKIES_B64      = os.environ.get("YOUTUBE_COOKIES_B64", "")
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-# ── Cookie setup ─────────────────────────────────────────────────────────────
-COOKIES_PATH = "/tmp/youtube_cookies.txt"
-YT_OPENER = None
-
-def setup_cookies():
-    global YT_OPENER
-    if not YOUTUBE_COOKIES_B64:
-        print("[worker] No YOUTUBE_COOKIES_B64 set — YouTube requests may be blocked")
-        return
-    try:
-        raw = base64.b64decode(YOUTUBE_COOKIES_B64).decode("utf-8")
-        with open(COOKIES_PATH, "w") as f:
-            f.write(raw)
-        jar = MozillaCookieJar(COOKIES_PATH)
-        jar.load(ignore_discard=True, ignore_expires=True)
-        YT_OPENER = build_opener(HTTPCookieProcessor(jar))
-        print(f"[worker] Loaded {len(jar)} YouTube cookies")
-    except Exception as e:
-        print(f"[worker] Cookie setup failed: {e}")
-
-def yt_urlopen(req, timeout=30):
-    if YT_OPENER:
-        return YT_OPENER.open(req, timeout=timeout)
-    return urlopen(req, timeout=timeout)
 
 # ── Supabase helpers ─────────────────────────────────────────────────────────
 def sb_headers():
@@ -100,7 +75,7 @@ def sb_insert(table, rows):
     except HTTPError as e:
         print(f"[sb_insert] {e.status}: {e.read()}")
 
-# ── YouTube Transcript (with cookies) ────────────────────────────────────────
+# ── YouTube helpers ──────────────────────────────────────────────────────────
 def extract_video_id(url):
     patterns = [
         r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})',
@@ -113,8 +88,126 @@ def extract_video_id(url):
             return m.group(1)
     return None
 
+# ── Supadata API (primary transcript source) ─────────────────────────────────
+def fetch_supadata_transcript(video_id):
+    """Fetch transcript via Supadata API — handles YouTube bot detection bypass."""
+    if not SUPADATA_API_KEY:
+        print("[worker] No SUPADATA_API_KEY set, skipping Supadata")
+        return None, None, None
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    print(f"[worker] Fetching transcript via Supadata API for {video_id}")
+
+    # Step 1: Get transcript (structured with timestamps)
+    transcript_url = f"https://api.supadata.ai/v1/youtube/transcript?url={quote(url, safe='')}"
+    req = Request(transcript_url, headers={
+        "x-api-key": SUPADATA_API_KEY,
+        "Accept": "application/json",
+    })
+    transcript_data = None
+    try:
+        resp = urlopen(req, timeout=30)
+        transcript_data = json.loads(resp.read())
+        print(f"[worker] Supadata transcript response type: {type(transcript_data).__name__}")
+    except HTTPError as e:
+        body = e.read().decode()
+        print(f"[worker] Supadata transcript error ({e.status}): {body[:200]}")
+        if e.status == 402:
+            print("[worker] Supadata credits exhausted")
+        return None, None, None
+    except Exception as e:
+        print(f"[worker] Supadata transcript fetch failed: {e}")
+        return None, None, None
+
+    # Step 2: Get video metadata (title, description)
+    video_info_url = f"https://api.supadata.ai/v1/youtube/video?url={quote(url, safe='')}"
+    req2 = Request(video_info_url, headers={
+        "x-api-key": SUPADATA_API_KEY,
+        "Accept": "application/json",
+    })
+    video_info = {}
+    try:
+        resp2 = urlopen(req2, timeout=15)
+        video_info = json.loads(resp2.read())
+        print(f"[worker] Supadata video info: title={video_info.get('title', 'N/A')[:60]}")
+    except Exception as e:
+        print(f"[worker] Supadata video info failed (non-fatal): {e}")
+
+    return transcript_data, video_info, "supadata"
+
+def parse_supadata_transcript(transcript_data):
+    """Parse Supadata transcript response into segments.
+    
+    Supadata can return:
+    - A list of objects with text/start/duration fields (structured)
+    - A string (plain text)
+    - An object with 'content' or 'transcript' field
+    """
+    segments = []
+
+    # Handle different response formats
+    if isinstance(transcript_data, list):
+        # Structured format: [{text, start, duration}, ...]
+        for item in transcript_data:
+            if isinstance(item, dict):
+                text = item.get("text", "").strip()
+                if not text:
+                    continue
+                start = float(item.get("start", item.get("startMs", 0)))
+                # If startMs is in milliseconds, convert
+                if start > 100000:
+                    start = start / 1000.0
+                duration = float(item.get("duration", item.get("dur", 3)))
+                if duration > 100000:
+                    duration = duration / 1000.0
+                segments.append({
+                    "text": text,
+                    "start": start,
+                    "end": start + duration,
+                })
+        if segments:
+            print(f"[worker] Parsed {len(segments)} structured Supadata segments")
+            return segments
+
+    elif isinstance(transcript_data, dict):
+        # Object with content field
+        content = transcript_data.get("content") or transcript_data.get("transcript") or ""
+        if isinstance(content, list):
+            return parse_supadata_transcript(content)
+        if isinstance(content, str) and content.strip():
+            transcript_data = content  # Fall through to string handling
+
+    # Plain text handling
+    if isinstance(transcript_data, str):
+        text = transcript_data.strip()
+        if not text:
+            return []
+        # Split into sentence-like chunks
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        if len(sentences) <= 1:
+            # Split on long pauses / natural breaks (every ~60 words)
+            words = text.split()
+            chunk_size = 40
+            for i in range(0, len(words), chunk_size):
+                chunk = " ".join(words[i:i+chunk_size])
+                t = (i / chunk_size) * 10.0
+                segments.append({"text": chunk, "start": t, "end": t + 10.0})
+        else:
+            t = 0.0
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent:
+                    continue
+                duration = max(2.0, len(sent.split()) * 0.4)
+                segments.append({"text": sent, "start": t, "end": t + duration})
+                t += duration
+        print(f"[worker] Parsed {len(segments)} text Supadata segments")
+
+    return segments
+
+# ── YouTube Transcript (direct, as fallback) ─────────────────────────────────
 def fetch_youtube_transcript(video_id):
-    print(f"[worker] Fetching YouTube transcript for {video_id}")
+    print(f"[worker] Fetching YouTube transcript directly for {video_id}")
     page_url = f"https://www.youtube.com/watch?v={video_id}"
     req = Request(page_url, headers={
         "User-Agent": USER_AGENT,
@@ -122,7 +215,7 @@ def fetch_youtube_transcript(video_id):
         "Accept": "text/html,application/xhtml+xml",
     })
     try:
-        resp = yt_urlopen(req, timeout=15)
+        resp = urlopen(req, timeout=15)
         page_html = resp.read().decode("utf-8", errors="replace")
         print(f"[worker] Video page: {len(page_html)} chars")
     except Exception as e:
@@ -195,7 +288,7 @@ def fetch_youtube_transcript(video_id):
 
     req = Request(track_url, headers={"User-Agent": USER_AGENT})
     try:
-        data = json.loads(yt_urlopen(req, timeout=15).read())
+        data = json.loads(urlopen(req, timeout=15).read())
     except Exception as e:
         print(f"[worker] Failed to fetch transcript data: {e}")
         return None
@@ -237,43 +330,31 @@ def fetch_youtube_transcript(video_id):
 
 # ── Pasted transcript parsing ────────────────────────────────────────────────
 def parse_pasted_transcript(text):
-    """Parse user-pasted YouTube transcript into structured segments.
-    
-    YouTube "Show transcript" format is typically:
-      0:00  text here
-      0:15  more text
-    
-    Or sometimes just plain text paragraphs.
-    """
     lines = text.strip().split("\n")
     segments = []
-    
-    # Try to detect timestamped format
     ts_pattern = re.compile(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(.*)')
     timestamped_lines = []
-    
+
     for line in lines:
         line = line.strip()
         if not line:
             continue
         m = ts_pattern.match(line)
         if m:
-            if m.group(3):  # HH:MM:SS
+            if m.group(3):
                 secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
-            else:  # MM:SS
+            else:
                 secs = int(m.group(1)) * 60 + int(m.group(2))
             text_part = m.group(4).strip()
             if text_part:
                 timestamped_lines.append((secs, text_part))
-    
+
     if len(timestamped_lines) > len(lines) * 0.3:
-        # Timestamped format detected
         for i, (start, text_part) in enumerate(timestamped_lines):
             end = timestamped_lines[i + 1][0] if i + 1 < len(timestamped_lines) else start + 10
             segments.append({"text": text_part, "start": float(start), "end": float(end)})
         print(f"[worker] Parsed pasted transcript: {len(segments)} timestamped segments")
     else:
-        # Plain text — split into ~sentence chunks
         full_text = " ".join(line.strip() for line in lines if line.strip())
         sentences = re.split(r'(?<=[.!?])\s+', full_text)
         t = 0.0
@@ -281,12 +362,11 @@ def parse_pasted_transcript(text):
             sent = sent.strip()
             if not sent:
                 continue
-            # Estimate ~3 seconds per sentence
             duration = max(2.0, len(sent.split()) * 0.4)
             segments.append({"text": sent, "start": t, "end": t + duration})
             t += duration
         print(f"[worker] Parsed pasted transcript: {len(segments)} sentence segments (no timestamps)")
-    
+
     return segments
 
 # ── Azure Blob helpers ───────────────────────────────────────────────────────
@@ -405,83 +485,6 @@ def parse_fast_utterances(result):
         utterances.append({"speaker": speaker, "text": text, "start": start, "end": start + duration})
     return utterances
 
-# ── Azure Speech: Batch Transcription (fallback) ────────────────────────────
-def speech_headers():
-    return {"Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY, "Content-Type": "application/json"}
-
-def submit_transcription_job(sas_url, analysis_id):
-    endpoint = AZURE_SPEECH_ENDPOINT.rstrip("/")
-    url = f"{endpoint}/speechtotext/v3.1/transcriptions"
-    body = {
-        "contentUrls": [sas_url], "locale": "en-US",
-        "displayName": f"analysis-{analysis_id}",
-        "properties": {"diarizationEnabled": True, "wordLevelTimestampsEnabled": False,
-                        "punctuationMode": "DictatedAndAutomatic", "profanityFilterMode": "None"},
-    }
-    req = Request(url, data=json.dumps(body).encode(), headers=speech_headers(), method="POST")
-    try:
-        return json.loads(urlopen(req).read())["self"]
-    except HTTPError as e:
-        raise RuntimeError(f"Speech submit failed ({e.status}): {e.read()}")
-
-def poll_transcription_job(job_url):
-    for _ in range(120):
-        time.sleep(5)
-        req = Request(job_url, headers={"Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY})
-        data = json.loads(urlopen(req).read())
-        if data["status"] == "Succeeded":
-            return data
-        if data["status"] == "Failed":
-            raise RuntimeError(f"Speech job failed: {data}")
-    raise RuntimeError("Speech job timed out")
-
-def fetch_transcription_results(job_data):
-    files_url = job_data["links"]["files"]
-    req = Request(files_url, headers={"Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY})
-    files_data = json.loads(urlopen(req).read())
-    file = next((f for f in files_data.get("values", []) if f["kind"] == "Transcription"), None)
-    if not file:
-        raise RuntimeError("No transcription file found")
-    return json.loads(urlopen(file["links"]["contentUrl"]).read())
-
-def parse_batch_utterances(result):
-    utterances = []
-    for phrase in result.get("recognizedPhrases", []):
-        best = phrase.get("nBest", [{}])[0]
-        text = best.get("display", "")
-        if not text:
-            continue
-        speaker = f"Speaker {phrase['speaker']}" if phrase.get("speaker") is not None else "Unknown"
-        start = phrase.get("offsetInTicks", 0) / 1e7
-        end = (phrase.get("offsetInTicks", 0) + phrase.get("durationInTicks", 0)) / 1e7
-        utterances.append({"speaker": speaker, "text": text, "start": start, "end": end})
-    return utterances
-
-# ── yt-dlp download (with cookies) ──────────────────────────────────────────
-def download_audio(youtube_url, audio_path):
-    base_args = ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
-                 "--audio-quality", "96K", "--user-agent", USER_AGENT,
-                 "--no-check-certificates"]
-    if os.path.exists(COOKIES_PATH):
-        base_args += ["--cookies", COOKIES_PATH]
-
-    strategies = [
-        base_args + ["--extractor-args", "youtube:player_client=web_creator", "-o", audio_path, youtube_url],
-        base_args + ["--extractor-args", "youtube:player_client=mediaconnect", "-o", audio_path, youtube_url],
-        base_args + ["--geo-bypass", "-o", audio_path, youtube_url],
-    ]
-    last_err = ""
-    for i, cmd in enumerate(strategies):
-        print(f"[worker] Download attempt {i+1}/{len(strategies)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0 and os.path.exists(audio_path):
-            return
-        last_err = result.stderr
-        print(f"[worker] Strategy {i+1} failed: {last_err[:200]}")
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-    raise RuntimeError(f"yt-dlp failed all strategies: {last_err}")
-
 # ── Azure OpenAI ─────────────────────────────────────────────────────────────
 OPENAI_URL = "https://openaiyoutube.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
 
@@ -504,8 +507,10 @@ def call_openai(instructions, input_text):
                     return block["text"]
     return data.get("output_text", "")
 
-def generate_insights(transcript, title):
+def generate_insights(transcript, title, description=""):
     ctx = f'Video title: "{title}"\n\n' if title else ""
+    if description:
+        ctx += f'Video description: "{description[:500]}"\n\n'
     t = transcript[:12000]
     prompts = [
         ("You are an expert media analyst. Produce a concise 3-5 sentence summary of the key points discussed.",
@@ -552,6 +557,7 @@ def run_pipeline(record):
     analysis_id = record["id"]
     youtube_url = record["youtube_url"]
     title = record.get("title")
+    description = record.get("description", "")
     user_id = record.get("user_id")
     t_start = time.time()
     print(f"[worker] Starting pipeline for {analysis_id} url={youtube_url}")
@@ -560,7 +566,6 @@ def run_pipeline(record):
         # ── Check for pasted transcript first ──
         pasted = record.get("pasted_transcript") or ""
         if not pasted:
-            # Fetch from DB in case webhook didn't include it
             rows = sb_get("analyses", {"id": analysis_id}, "pasted_transcript")
             if rows and rows[0].get("pasted_transcript"):
                 pasted = rows[0]["pasted_transcript"]
@@ -580,71 +585,78 @@ def run_pipeline(record):
             used_source = "pasted transcript"
 
         else:
-            # ── TRACK 1: YouTube transcript (cookies help bypass bot detection) ──
             video_id = extract_video_id(youtube_url)
-            yt_transcript = None
-            if video_id:
-                set_status(analysis_id, "extracting")
-                yt_transcript = fetch_youtube_transcript(video_id)
+            if not video_id:
+                fail_analysis(analysis_id, "Could not extract video ID from URL")
+                return
 
-            if yt_transcript and len(yt_transcript) > 5:
-                print(f"[worker] Using YouTube transcript ({len(yt_transcript)} segments)")
+            # ── TRACK 1: Supadata API (primary — bypasses YouTube bot detection) ──
+            set_status(analysis_id, "extracting")
+            transcript_data, video_info, src = fetch_supadata_transcript(video_id)
+
+            if transcript_data:
                 set_status(analysis_id, "transcribing")
-                utterances = [
-                    {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
-                    for seg in yt_transcript
-                ]
-                polished = "\n".join(seg["text"] for seg in yt_transcript)
-                raw_data = {"source": "youtube_captions", "segments": yt_transcript}
-                used_source = "YouTube captions"
-            else:
-                # ── TRACK 2: yt-dlp + Azure Speech ──
-                # Without cookies, yt-dlp will also be blocked. Fail with helpful message.
-                if not YOUTUBE_COOKIES_B64 and not os.path.exists(COOKIES_PATH):
-                    fail_analysis(analysis_id,
-                        "YouTube blocks server access. Please use the 'Paste transcript manually' "
-                        "option on the dashboard: on the YouTube video tap ⋯ → Show transcript → "
-                        "copy the text → paste it into TubeScribe.")
-                    return
-                print("[worker] No YouTube transcript, trying yt-dlp download...")
+                segments = parse_supadata_transcript(transcript_data)
 
-                with tempfile.TemporaryDirectory() as tmp:
-                    audio_path = f"{tmp}/audio.mp3"
+                # Update title/description from Supadata if not already set
+                if video_info:
+                    if not title and video_info.get("title"):
+                        title = video_info["title"]
+                        sb_patch("analyses", {"id": analysis_id}, {"title": title})
+                    if not description and video_info.get("description"):
+                        description = video_info["description"]
 
-                    set_status(analysis_id, "extracting")
-                    t0 = time.time()
-                    download_audio(youtube_url, audio_path)
-                    file_size = os.path.getsize(audio_path)
-                    print(f"[worker] Downloaded in {time.time()-t0:.1f}s ({file_size/1024/1024:.1f}MB)")
+                if segments and len(segments) > 0:
+                    print(f"[worker] Using Supadata transcript ({len(segments)} segments)")
+                    utterances = [
+                        {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
+                        for seg in segments
+                    ]
+                    polished = "\n".join(seg["text"] for seg in segments)
+                    raw_data = {"source": "supadata_api", "segments": len(segments),
+                                "video_info": video_info if video_info else {}}
+                    used_source = "Supadata API"
+                else:
+                    # Supadata returned data but we couldn't parse segments
+                    # Try treating the whole response as text
+                    if isinstance(transcript_data, str) and len(transcript_data.strip()) > 50:
+                        text = transcript_data.strip()
+                        utterances = [{"speaker": "Narrator", "text": text, "start": 0.0, "end": len(text.split()) * 0.4}]
+                        polished = text
+                        raw_data = {"source": "supadata_api_text", "char_count": len(text)}
+                        used_source = "Supadata API (plain text)"
+                    else:
+                        transcript_data = None  # Fall through to next track
 
+            if not transcript_data or (not segments if 'segments' in dir() else True):
+                # ── TRACK 2: YouTube transcript (direct scrape, may be blocked) ──
+                yt_transcript = fetch_youtube_transcript(video_id) if video_id else None
+
+                if yt_transcript and len(yt_transcript) > 5:
+                    print(f"[worker] Using YouTube transcript ({len(yt_transcript)} segments)")
                     set_status(analysis_id, "transcribing")
-                    t0 = time.time()
-                    use_fast = file_size < MAX_FAST_TRANSCRIBE_SIZE
-                    if use_fast:
-                        try:
-                            result_data = fast_transcribe(audio_path, analysis_id)
-                            utterances = parse_fast_utterances(result_data)
-                            print(f"[worker] Fast transcription: {len(utterances)} utterances in {time.time()-t0:.1f}s")
-                        except Exception as e:
-                            print(f"[worker] Fast failed, batch fallback: {e}")
-                            use_fast = False
-
-                    if not use_fast:
-                        blob_name = f"{analysis_id}.mp3"
-                        upload_blob(audio_path, blob_name)
-                        sas_url = generate_sas_url(blob_name)
-                        job_url = submit_transcription_job(sas_url, analysis_id)
-                        job_data = poll_transcription_job(job_url)
-                        result_data = fetch_transcription_results(job_data)
-                        utterances = parse_batch_utterances(result_data)
-
-                    polished = "\n".join(f"[{u['speaker']}]: {u['text']}" for u in utterances)
-                    raw_data = result_data
-                    used_source = "Azure Speech"
+                    utterances = [
+                        {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
+                        for seg in yt_transcript
+                    ]
+                    polished = "\n".join(seg["text"] for seg in yt_transcript)
+                    raw_data = {"source": "youtube_captions", "segments": yt_transcript}
+                    used_source = "YouTube captions"
+                else:
+                    # ── TRACK 3: Fail with helpful message ──
+                    if SUPADATA_API_KEY:
+                        fail_analysis(analysis_id,
+                            "Could not extract transcript. The Supadata API may be out of credits, "
+                            "or this video has no available captions. Try the 'Paste transcript' option.")
+                    else:
+                        fail_analysis(analysis_id,
+                            "YouTube blocks server access for transcript extraction. "
+                            "Please use the 'Paste transcript manually' option on the dashboard.")
+                    return
 
         # ── AI Insights ──
         set_status(analysis_id, "processing")
-        insights = generate_insights(polished, title)
+        insights = generate_insights(polished, title, description)
 
         # ── Save ──
         sb_patch("analyses", {"id": analysis_id}, {
@@ -674,10 +686,12 @@ def run_pipeline(record):
 # ── HTTP Server ───────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        has_cookies = "yes" if os.path.exists(COOKIES_PATH) else "no"
+        supadata = "yes" if SUPADATA_API_KEY else "no"
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(json.dumps({"status": "ok", "version": "v5", "cookies": has_cookies}).encode())
+        self.wfile.write(json.dumps({
+            "status": "ok", "version": "v6", "supadata": supadata
+        }).encode())
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -708,6 +722,6 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[http] {args[0]} {args[1]}")
 
 if __name__ == "__main__":
-    setup_cookies()
-    print(f"[worker] v5 Listening on port {PORT}")
+    print(f"[worker] v6 — Supadata: {'enabled' if SUPADATA_API_KEY else 'not configured'}")
+    print(f"[worker] Listening on port {PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
