@@ -8,11 +8,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
-import { Sparkles } from "lucide-react";
 
-export const Route = createFileRoute("/auth")({
-  component: AuthPage,
-});
+export const Route = createFileRoute("/auth")(
+  { component: AuthPage }
+);
 
 function AuthPage() {
   const { user, loading } = useAuth();
@@ -72,8 +71,13 @@ function AuthPage() {
       <main className="mx-auto max-w-md px-6 py-16">
         <div className="rounded-2xl border border-border bg-surface/60 p-8 shadow-[var(--shadow-card)]">
           <div className="flex items-center gap-2 mb-6">
-            <Sparkles className="h-5 w-5 text-primary" />
-            <h1 className="font-display text-2xl font-semibold">Welcome to Lumen</h1>
+            <svg viewBox="0 0 40 40" fill="none" className="h-6 w-6" xmlns="http://www.w3.org/2000/svg">
+              <rect width="40" height="40" rx="10" fill="url(#ts-auth)" />
+              <path d="M16 12L28 20L16 28V12Z" fill="white" opacity="0.95" />
+              <path d="M12 30L14 22L20 26L12 30Z" fill="white" opacity="0.7" />
+              <defs><linearGradient id="ts-auth" x1="0" y1="0" x2="40" y2="40"><stop stopColor="#EF4444" /><stop offset="1" stopColor="#B91C1C" /></linearGradient></defs>
+            </svg>
+            <h1 className="font-display text-2xl font-semibold">Welcome to TubeScribe</h1>
           </div>
           <Tabs defaultValue="signin" className="w-full">
             <TabsList className="grid w-full grid-cols-2">
@@ -90,7 +94,7 @@ function AuthPage() {
                   <Label htmlFor="si-pw">Password</Label>
                   <Input id="si-pw" type="password" required value={password} onChange={(e) => setPassword(e.target.value)} />
                 </div>
-                <Button type="submit" disabled={busy} className="w-full">Sign in</Button>
+                <Button type="submit" disabled={busy} className="w-full bg-red-600 hover:bg-red-700 text-white">Sign in</Button>
               </form>
             </TabsContent>
             <TabsContent value="signup" className="mt-6">
@@ -107,7 +111,7 @@ function AuthPage() {
                   <Label htmlFor="su-pw">Password</Label>
                   <Input id="su-pw" type="password" required minLength={6} value={password} onChange={(e) => setPassword(e.target.value)} />
                 </div>
-                <Button type="submit" disabled={busy} className="w-full">Create account</Button>
+                <Button type="submit" disabled={busy} className="w-full bg-red-600 hover:bg-red-700 text-white">Create account</Button>
               </form>
             </TabsContent>
           </Tabs>
