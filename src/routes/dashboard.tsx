@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { extractYouTubeId, fetchYouTubeOEmbed } from "@/lib/youtube";
 import { toast } from "sonner";
-import { Plus, Loader2, Play } from "lucide-react";
+import { Plus, Loader2, Play, ClipboardPaste, ChevronDown, ChevronUp } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 
 export const Route = createFileRoute("/dashboard")({
@@ -28,6 +28,8 @@ function Dashboard() {
   const { user, loading } = useAuth();
   const navigate = useNavigate();
   const [url, setUrl] = useState("");
+  const [pastedTranscript, setPastedTranscript] = useState("");
+  const [showPaste, setShowPaste] = useState(false);
   const [creating, setCreating] = useState(false);
   const [analyses, setAnalyses] = useState<Analysis[]>([]);
   const [listLoading, setListLoading] = useState(true);
@@ -54,20 +56,27 @@ function Dashboard() {
     if (!user) return;
     const ytId = extractYouTubeId(url);
     if (!ytId) return toast.error("That doesn't look like a YouTube URL");
+
+    const hasTranscript = showPaste && pastedTranscript.trim().length > 50;
+
     setCreating(true);
     try {
       const oembed = await fetchYouTubeOEmbed(url).catch(() => null);
+      const insertData: Record<string, unknown> = {
+        user_id: user.id,
+        youtube_url: url,
+        youtube_id: ytId,
+        title: oembed?.title ?? null,
+        channel: oembed?.author_name ?? null,
+        thumbnail_url: oembed?.thumbnail_url ?? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`,
+        status: "pending",
+      };
+      if (hasTranscript) {
+        insertData.pasted_transcript = pastedTranscript.trim();
+      }
       const { data, error } = await supabase
         .from("analyses")
-        .insert({
-          user_id: user.id,
-          youtube_url: url,
-          youtube_id: ytId,
-          title: oembed?.title ?? null,
-          channel: oembed?.author_name ?? null,
-          thumbnail_url: oembed?.thumbnail_url ?? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`,
-          status: "pending",
-        })
+        .insert(insertData)
         .select("id")
         .single();
       if (error) throw error;
@@ -88,17 +97,57 @@ function Dashboard() {
           <p className="mt-2 text-muted-foreground">Paste a YouTube URL to analyze it. All work is autosaved.</p>
         </div>
 
-        <form onSubmit={onCreate} className="flex gap-2 mb-12">
-          <Input
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://www.youtube.com/watch?v=..."
-            className="h-12 text-base"
-          />
-          <Button type="submit" size="lg" disabled={creating || !url}>
-            {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-            New analysis
-          </Button>
+        <form onSubmit={onCreate} className="mb-12 space-y-3">
+          <div className="flex gap-2">
+            <Input
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://www.youtube.com/watch?v=..."
+              className="h-12 text-base"
+            />
+            <Button type="submit" size="lg" disabled={creating || !url}>
+              {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+              Analyze
+            </Button>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setShowPaste(!showPaste)}
+            className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <ClipboardPaste className="h-3.5 w-3.5" />
+            Paste transcript manually
+            {showPaste ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+          </button>
+
+          {showPaste && (
+            <div className="rounded-xl border border-border bg-surface/40 p-4 space-y-3 animate-in slide-in-from-top-2 duration-200">
+              <div className="flex items-start gap-3">
+                <div className="shrink-0 h-6 w-6 rounded-full bg-red-100 dark:bg-red-950/50 grid place-items-center">
+                  <span className="text-xs font-bold text-red-600">?</span>
+                </div>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  On the YouTube video, tap <strong>⋯</strong> → <strong>Show transcript</strong> → select all the text and paste it below.
+                  TubeScribe will handle the rest.
+                </p>
+              </div>
+              <textarea
+                value={pastedTranscript}
+                onChange={(e) => setPastedTranscript(e.target.value)}
+                placeholder="Paste the transcript text here..."
+                className="w-full min-h-[160px] rounded-lg border border-border bg-background px-4 py-3 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-red-500/40 resize-y"
+              />
+              {pastedTranscript.trim().length > 0 && pastedTranscript.trim().length < 50 && (
+                <p className="text-xs text-amber-600">Transcript looks too short. Make sure you copied the full transcript.</p>
+              )}
+              {pastedTranscript.trim().length >= 50 && (
+                <p className="text-xs text-green-600">
+                  ✓ {pastedTranscript.trim().split(/\s+/).length.toLocaleString()} words ready for analysis
+                </p>
+              )}
+            </div>
+          )}
         </form>
 
         {listLoading ? (

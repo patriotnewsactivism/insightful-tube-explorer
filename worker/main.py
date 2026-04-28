@@ -1,9 +1,9 @@
 """
-insightful-tube-explorer: Audio Worker v4
-Handles: YouTube transcript (with cookies) → yt-dlp fallback (with cookies)
+insightful-tube-explorer: Audio Worker v5
+Handles: Pasted transcript → YouTube transcript (with cookies) → yt-dlp fallback
          → Azure Speech fast transcription → Azure OpenAI insights (parallel)
 
-v4: Cookie-based authentication to bypass YouTube datacenter IP blocking
+v5: Paste-to-analyze mode — accepts pasted_transcript field to bypass YouTube entirely
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -51,7 +51,6 @@ def setup_cookies():
         print(f"[worker] Cookie setup failed: {e}")
 
 def yt_urlopen(req, timeout=30):
-    """Open a YouTube URL using cookies if available."""
     if YT_OPENER:
         return YT_OPENER.open(req, timeout=timeout)
     return urlopen(req, timeout=timeout)
@@ -73,6 +72,17 @@ def sb_patch(table, match, data):
         urlopen(req)
     except HTTPError as e:
         print(f"[sb_patch] {e.status}: {e.read()}")
+
+def sb_get(table, match, select="*"):
+    params = "&".join(f"{k}=eq.{v}" for k, v in match.items())
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{params}&select={select}"
+    headers = {**sb_headers(), "Prefer": ""}
+    req = Request(url, headers=headers)
+    try:
+        return json.loads(urlopen(req).read())
+    except Exception as e:
+        print(f"[sb_get] {e}")
+        return []
 
 def set_status(analysis_id, status, extra={}):
     sb_patch("analyses", {"id": analysis_id}, {"status": status, **extra})
@@ -104,9 +114,7 @@ def extract_video_id(url):
     return None
 
 def fetch_youtube_transcript(video_id):
-    """Fetch transcript from YouTube using cookies for auth."""
     print(f"[worker] Fetching YouTube transcript for {video_id}")
-
     page_url = f"https://www.youtube.com/watch?v={video_id}"
     req = Request(page_url, headers={
         "User-Agent": USER_AGENT,
@@ -121,12 +129,10 @@ def fetch_youtube_transcript(video_id):
         print(f"[worker] Failed to fetch video page: {e}")
         return None
 
-    # Check for bot block
     if "Sign in to confirm" in page_html and "not a bot" in page_html:
         print("[worker] YouTube bot detection triggered on page fetch")
         return None
 
-    # Extract ytInitialPlayerResponse
     patterns = [
         r'var\s+ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;',
         r'ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;',
@@ -153,13 +159,11 @@ def fetch_youtube_transcript(video_id):
         print("[worker] Could not extract player response")
         return None
 
-    # Check playability
     ps = player_json.get("playabilityStatus", {})
     if ps.get("status") != "OK":
         print(f"[worker] Playability: {ps.get('status')} - {ps.get('reason', 'N/A')}")
         return None
 
-    # Get caption tracks
     captions = player_json.get("captions", {}).get("playerCaptionsTracklistRenderer", {})
     tracks = captions.get("captionTracks", [])
     if not tracks:
@@ -214,7 +218,6 @@ def fetch_youtube_transcript(video_id):
     if not segments:
         return None
 
-    # Merge short segments
     merged = []
     buf = {"text": "", "start": 0, "end": 0}
     for seg in segments:
@@ -231,6 +234,60 @@ def fetch_youtube_transcript(video_id):
 
     print(f"[worker] YouTube transcript: {len(merged)} segments ({len(segments)} raw)")
     return merged
+
+# ── Pasted transcript parsing ────────────────────────────────────────────────
+def parse_pasted_transcript(text):
+    """Parse user-pasted YouTube transcript into structured segments.
+    
+    YouTube "Show transcript" format is typically:
+      0:00  text here
+      0:15  more text
+    
+    Or sometimes just plain text paragraphs.
+    """
+    lines = text.strip().split("\n")
+    segments = []
+    
+    # Try to detect timestamped format
+    ts_pattern = re.compile(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(.*)')
+    timestamped_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = ts_pattern.match(line)
+        if m:
+            if m.group(3):  # HH:MM:SS
+                secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+            else:  # MM:SS
+                secs = int(m.group(1)) * 60 + int(m.group(2))
+            text_part = m.group(4).strip()
+            if text_part:
+                timestamped_lines.append((secs, text_part))
+    
+    if len(timestamped_lines) > len(lines) * 0.3:
+        # Timestamped format detected
+        for i, (start, text_part) in enumerate(timestamped_lines):
+            end = timestamped_lines[i + 1][0] if i + 1 < len(timestamped_lines) else start + 10
+            segments.append({"text": text_part, "start": float(start), "end": float(end)})
+        print(f"[worker] Parsed pasted transcript: {len(segments)} timestamped segments")
+    else:
+        # Plain text — split into ~sentence chunks
+        full_text = " ".join(line.strip() for line in lines if line.strip())
+        sentences = re.split(r'(?<=[.!?])\s+', full_text)
+        t = 0.0
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            # Estimate ~3 seconds per sentence
+            duration = max(2.0, len(sent.split()) * 0.4)
+            segments.append({"text": sent, "start": t, "end": t + duration})
+            t += duration
+        print(f"[worker] Parsed pasted transcript: {len(segments)} sentence segments (no timestamps)")
+    
+    return segments
 
 # ── Azure Blob helpers ───────────────────────────────────────────────────────
 def parse_conn_str(cs):
@@ -500,60 +557,83 @@ def run_pipeline(record):
     print(f"[worker] Starting pipeline for {analysis_id} url={youtube_url}")
 
     try:
-        # ── TRACK 1: YouTube transcript (cookies help bypass bot detection) ──
-        video_id = extract_video_id(youtube_url)
-        yt_transcript = None
-        if video_id:
-            set_status(analysis_id, "extracting")
-            yt_transcript = fetch_youtube_transcript(video_id)
+        # ── Check for pasted transcript first ──
+        pasted = record.get("pasted_transcript") or ""
+        if not pasted:
+            # Fetch from DB in case webhook didn't include it
+            rows = sb_get("analyses", {"id": analysis_id}, "pasted_transcript")
+            if rows and rows[0].get("pasted_transcript"):
+                pasted = rows[0]["pasted_transcript"]
 
-        if yt_transcript and len(yt_transcript) > 5:
-            print(f"[worker] Using YouTube transcript ({len(yt_transcript)} segments)")
+        if pasted and len(pasted.strip()) > 50:
+            # ── TRACK 0: Pasted transcript mode ──
+            print(f"[worker] Using pasted transcript ({len(pasted)} chars)")
             set_status(analysis_id, "transcribing")
+
+            segments = parse_pasted_transcript(pasted)
             utterances = [
                 {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
-                for seg in yt_transcript
+                for seg in segments
             ]
-            polished = "\n".join(seg["text"] for seg in yt_transcript)
-            raw_data = {"source": "youtube_captions", "segments": yt_transcript}
-            used_yt_captions = True
+            polished = "\n".join(seg["text"] for seg in segments)
+            raw_data = {"source": "pasted_transcript", "char_count": len(pasted), "segments": len(segments)}
+            used_source = "pasted transcript"
+
         else:
-            # ── TRACK 2: yt-dlp + Azure Speech ──
-            print("[worker] No YouTube transcript, trying yt-dlp download...")
-            used_yt_captions = False
-
-            with tempfile.TemporaryDirectory() as tmp:
-                audio_path = f"{tmp}/audio.mp3"
-
+            # ── TRACK 1: YouTube transcript (cookies help bypass bot detection) ──
+            video_id = extract_video_id(youtube_url)
+            yt_transcript = None
+            if video_id:
                 set_status(analysis_id, "extracting")
-                t0 = time.time()
-                download_audio(youtube_url, audio_path)
-                file_size = os.path.getsize(audio_path)
-                print(f"[worker] Downloaded in {time.time()-t0:.1f}s ({file_size/1024/1024:.1f}MB)")
+                yt_transcript = fetch_youtube_transcript(video_id)
 
+            if yt_transcript and len(yt_transcript) > 5:
+                print(f"[worker] Using YouTube transcript ({len(yt_transcript)} segments)")
                 set_status(analysis_id, "transcribing")
-                t0 = time.time()
-                use_fast = file_size < MAX_FAST_TRANSCRIBE_SIZE
-                if use_fast:
-                    try:
-                        result_data = fast_transcribe(audio_path, analysis_id)
-                        utterances = parse_fast_utterances(result_data)
-                        print(f"[worker] Fast transcription: {len(utterances)} utterances in {time.time()-t0:.1f}s")
-                    except Exception as e:
-                        print(f"[worker] Fast failed, batch fallback: {e}")
-                        use_fast = False
+                utterances = [
+                    {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
+                    for seg in yt_transcript
+                ]
+                polished = "\n".join(seg["text"] for seg in yt_transcript)
+                raw_data = {"source": "youtube_captions", "segments": yt_transcript}
+                used_source = "YouTube captions"
+            else:
+                # ── TRACK 2: yt-dlp + Azure Speech ──
+                print("[worker] No YouTube transcript, trying yt-dlp download...")
 
-                if not use_fast:
-                    blob_name = f"{analysis_id}.mp3"
-                    upload_blob(audio_path, blob_name)
-                    sas_url = generate_sas_url(blob_name)
-                    job_url = submit_transcription_job(sas_url, analysis_id)
-                    job_data = poll_transcription_job(job_url)
-                    result_data = fetch_transcription_results(job_data)
-                    utterances = parse_batch_utterances(result_data)
+                with tempfile.TemporaryDirectory() as tmp:
+                    audio_path = f"{tmp}/audio.mp3"
 
-                polished = "\n".join(f"[{u['speaker']}]: {u['text']}" for u in utterances)
-                raw_data = result_data
+                    set_status(analysis_id, "extracting")
+                    t0 = time.time()
+                    download_audio(youtube_url, audio_path)
+                    file_size = os.path.getsize(audio_path)
+                    print(f"[worker] Downloaded in {time.time()-t0:.1f}s ({file_size/1024/1024:.1f}MB)")
+
+                    set_status(analysis_id, "transcribing")
+                    t0 = time.time()
+                    use_fast = file_size < MAX_FAST_TRANSCRIBE_SIZE
+                    if use_fast:
+                        try:
+                            result_data = fast_transcribe(audio_path, analysis_id)
+                            utterances = parse_fast_utterances(result_data)
+                            print(f"[worker] Fast transcription: {len(utterances)} utterances in {time.time()-t0:.1f}s")
+                        except Exception as e:
+                            print(f"[worker] Fast failed, batch fallback: {e}")
+                            use_fast = False
+
+                    if not use_fast:
+                        blob_name = f"{analysis_id}.mp3"
+                        upload_blob(audio_path, blob_name)
+                        sas_url = generate_sas_url(blob_name)
+                        job_url = submit_transcription_job(sas_url, analysis_id)
+                        job_data = poll_transcription_job(job_url)
+                        result_data = fetch_transcription_results(job_data)
+                        utterances = parse_batch_utterances(result_data)
+
+                    polished = "\n".join(f"[{u['speaker']}]: {u['text']}" for u in utterances)
+                    raw_data = result_data
+                    used_source = "Azure Speech"
 
         # ── AI Insights ──
         set_status(analysis_id, "processing")
@@ -579,8 +659,7 @@ def run_pipeline(record):
                 sb_insert("speaker_utterances", rows[i:i+500])
 
         total = time.time() - t_start
-        source = "YouTube captions" if used_yt_captions else "Azure Speech"
-        print(f"[worker] ✅ Complete in {total:.1f}s ({source}) for {analysis_id}")
+        print(f"[worker] ✅ Complete in {total:.1f}s ({used_source}) for {analysis_id}")
 
     except Exception as e:
         fail_analysis(analysis_id, str(e))
@@ -591,7 +670,7 @@ class Handler(BaseHTTPRequestHandler):
         has_cookies = "yes" if os.path.exists(COOKIES_PATH) else "no"
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(json.dumps({"status": "ok", "version": "v4", "cookies": has_cookies}).encode())
+        self.wfile.write(json.dumps({"status": "ok", "version": "v5", "cookies": has_cookies}).encode())
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -623,5 +702,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     setup_cookies()
-    print(f"[worker] v4 Listening on port {PORT}")
+    print(f"[worker] v5 Listening on port {PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
