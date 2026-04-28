@@ -513,6 +513,8 @@ def parse_fast_utterances(result):
 # ── Azure OpenAI ─────────────────────────────────────────────────────────────
 OPENAI_URL = "https://openaiyoutube.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
 
+CONTENT_FILTER_FALLBACK = "[Content filtered by Azure — this section could not be analyzed due to content policy restrictions on the transcript material.]"
+
 def call_openai(instructions, input_text, max_tokens=2000):
     body = {
         "model": AZURE_OPENAI_DEPLOYMENT, "instructions": instructions,
@@ -524,7 +526,13 @@ def call_openai(instructions, input_text, max_tokens=2000):
     try:
         data = json.loads(urlopen(req).read())
     except HTTPError as e:
-        raise RuntimeError(f"Azure OpenAI failed ({e.status}): {e.read()}")
+        body_bytes = e.read()
+        body_str = body_bytes.decode("utf-8", errors="replace") if isinstance(body_bytes, bytes) else str(body_bytes)
+        # If Azure content filter triggered, return fallback instead of crashing pipeline
+        if e.status == 400 and "content_filter" in body_str:
+            print(f"[call_openai] Content filter triggered, returning fallback. Details: {body_str[:300]}")
+            return CONTENT_FILTER_FALLBACK
+        raise RuntimeError(f"Azure OpenAI failed ({e.status}): {body_str}")
     for item in data.get("output", []):
         if item.get("type") == "message":
             for block in item.get("content", []):
