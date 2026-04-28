@@ -1,16 +1,16 @@
 """
-insightful-tube-explorer: Audio Worker v2
-Handles: yt-dlp download → Azure Speech fast transcription
-         → Azure OpenAI insights (parallel) → Supabase update
+insightful-tube-explorer: Audio Worker v3
+Handles: YouTube transcript API (primary) → yt-dlp fallback
+         → Azure Speech fast transcription → Azure OpenAI insights (parallel)
+         → Supabase update
 
-Key v2 improvements:
-- Fast transcription API (synchronous, no polling, no blob upload)
-- Parallel OpenAI calls (4x speedup)  
-- Node.js runtime for yt-dlp + bot detection workarounds
-- Granular timing logs
+v3 improvements:
+- YouTube transcript API as primary path (no download, no bot detection)
+- yt-dlp + Azure Speech as fallback for videos without transcripts
+- ~10x faster for videos with available transcripts
 """
 
-import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io
+import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen, Request
@@ -29,6 +29,8 @@ AZURE_STORAGE_CONTAINER  = "transcriptions"
 AZURE_OPENAI_KEY         = os.environ["AZURE_OPENAI_API_KEY"]
 AZURE_OPENAI_DEPLOYMENT  = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
 PORT                     = int(os.environ.get("PORT", 8080))
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 # ── Supabase helpers ─────────────────────────────────────────────────────────
 def sb_headers():
@@ -63,6 +65,151 @@ def sb_insert(table, rows):
         urlopen(req)
     except HTTPError as e:
         print(f"[sb_insert] {e.status}: {e.read()}")
+
+# ── YouTube Transcript API (no video download needed) ────────────────────────
+def extract_video_id(url):
+    """Extract YouTube video ID from various URL formats."""
+    patterns = [
+        r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})',
+        r'(?:embed/)([a-zA-Z0-9_-]{11})',
+        r'^([a-zA-Z0-9_-]{11})$',
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+def fetch_youtube_transcript(video_id):
+    """Fetch auto-generated or manual transcript directly from YouTube.
+    Returns list of {text, start, end} or None if unavailable."""
+    print(f"[worker] Attempting YouTube transcript API for {video_id}")
+
+    # Fetch video page to get caption track info
+    page_url = f"https://www.youtube.com/watch?v={video_id}"
+    req = Request(page_url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml",
+    })
+    try:
+        resp = urlopen(req, timeout=15)
+        page_html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"[worker] Failed to fetch video page: {e}")
+        return None
+
+    # Extract ytInitialPlayerResponse JSON
+    patterns = [
+        r'var\s+ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;',
+        r'ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;',
+    ]
+    player_json = None
+    for pat in patterns:
+        m = re.search(pat, page_html, re.DOTALL)
+        if m:
+            try:
+                player_json = json.loads(m.group(1))
+                break
+            except json.JSONDecodeError:
+                # Try truncating at the right brace
+                raw = m.group(1)
+                depth = 0
+                for i, c in enumerate(raw):
+                    if c == '{': depth += 1
+                    elif c == '}': depth -= 1
+                    if depth == 0:
+                        try:
+                            player_json = json.loads(raw[:i+1])
+                            break
+                        except json.JSONDecodeError:
+                            pass
+                if player_json:
+                    break
+
+    if not player_json:
+        print("[worker] Could not extract player response from page")
+        return None
+
+    # Get caption tracks
+    captions = player_json.get("captions", {}).get("playerCaptionsTracklistRenderer", {})
+    tracks = captions.get("captionTracks", [])
+    if not tracks:
+        print("[worker] No caption tracks found")
+        return None
+
+    # Prefer English manual captions, then English auto, then first available
+    en_manual = None
+    en_auto = None
+    for track in tracks:
+        lang = track.get("languageCode", "")
+        kind = track.get("kind", "")
+        if lang.startswith("en"):
+            if kind != "asr":
+                en_manual = track
+            else:
+                en_auto = en_auto or track
+
+    chosen = en_manual or en_auto or tracks[0]
+    track_url = chosen.get("baseUrl", "")
+    if not track_url:
+        print("[worker] No baseUrl in caption track")
+        return None
+
+    kind_label = "manual" if chosen.get("kind") != "asr" else "auto-generated"
+    lang = chosen.get("languageCode", "?")
+    print(f"[worker] Found {kind_label} captions ({lang})")
+
+    # Fetch transcript as JSON3 format
+    if "&fmt=" not in track_url:
+        track_url += "&fmt=json3"
+    else:
+        track_url = re.sub(r'&fmt=[^&]*', '&fmt=json3', track_url)
+
+    req = Request(track_url, headers={"User-Agent": USER_AGENT})
+    try:
+        data = json.loads(urlopen(req, timeout=15).read())
+    except Exception as e:
+        print(f"[worker] Failed to fetch transcript data: {e}")
+        return None
+
+    # Parse events into segments
+    segments = []
+    for event in data.get("events", []):
+        segs = event.get("segs", [])
+        text = "".join(s.get("utf8", "") for s in segs).strip()
+        text = html_mod.unescape(text)
+        if not text or text == "\n":
+            continue
+        start_ms = event.get("tStartMs", 0)
+        duration_ms = event.get("dDurationMs", 0)
+        segments.append({
+            "text": text,
+            "start": start_ms / 1000.0,
+            "end": (start_ms + duration_ms) / 1000.0,
+        })
+
+    if not segments:
+        print("[worker] Transcript had no usable segments")
+        return None
+
+    # Merge short segments into sentences
+    merged = []
+    buffer = {"text": "", "start": 0, "end": 0}
+    for seg in segments:
+        if not buffer["text"]:
+            buffer = dict(seg)
+        elif len(buffer["text"]) < 80 and not buffer["text"].rstrip().endswith(('.', '!', '?')):
+            buffer["text"] += " " + seg["text"]
+            buffer["end"] = seg["end"]
+        else:
+            merged.append(buffer)
+            buffer = dict(seg)
+    if buffer["text"]:
+        merged.append(buffer)
+
+    print(f"[worker] YouTube transcript: {len(merged)} segments ({len(segments)} raw)")
+    return merged
 
 # ── Azure Blob helpers (fallback for batch transcription) ────────────────────
 def parse_conn_str(cs):
@@ -127,10 +274,7 @@ def parse_iso_duration(s):
     m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?', s)
     if not m:
         return 0.0
-    hours = int(m.group(1) or 0)
-    minutes = int(m.group(2) or 0)
-    seconds = float(m.group(3) or 0)
-    return hours * 3600 + minutes * 60 + seconds
+    return int(m.group(1) or 0)*3600 + int(m.group(2) or 0)*60 + float(m.group(3) or 0)
 
 def fast_transcribe(audio_path, analysis_id):
     endpoint = AZURE_SPEECH_ENDPOINT.rstrip("/")
@@ -182,8 +326,7 @@ def parse_fast_utterances(result):
         speaker = f"Speaker {speaker_num}" if speaker_num is not None else "Unknown"
         start = parse_iso_duration(phrase.get("offset", ""))
         duration = parse_iso_duration(phrase.get("duration", ""))
-        end = start + duration
-        utterances.append({"speaker": speaker, "text": text, "start": start, "end": end})
+        utterances.append({"speaker": speaker, "text": text, "start": start, "end": start + duration})
     return utterances
 
 # ── Azure Speech: Batch Transcription (fallback) ────────────────────────────
@@ -239,6 +382,31 @@ def parse_batch_utterances(result):
         utterances.append({"speaker": speaker, "text": text, "start": start, "end": end})
     return utterances
 
+# ── yt-dlp download (fallback) ──────────────────────────────────────────────
+def download_audio(youtube_url, audio_path):
+    strategies = [
+        ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3", "--audio-quality", "96K",
+         "--extractor-args", "youtube:player_client=web_creator",
+         "--user-agent", USER_AGENT, "--no-check-certificates", "-o", audio_path, youtube_url],
+        ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3", "--audio-quality", "96K",
+         "--extractor-args", "youtube:player_client=mediaconnect",
+         "--user-agent", USER_AGENT, "--no-check-certificates", "-o", audio_path, youtube_url],
+        ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3", "--audio-quality", "96K",
+         "--user-agent", USER_AGENT, "--geo-bypass", "--no-check-certificates",
+         "-o", audio_path, youtube_url],
+    ]
+    last_err = ""
+    for i, cmd in enumerate(strategies):
+        print(f"[worker] Download attempt {i+1}/{len(strategies)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0 and os.path.exists(audio_path):
+            return
+        last_err = result.stderr
+        print(f"[worker] Strategy {i+1} failed: {last_err[:200]}")
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+    raise RuntimeError(f"yt-dlp failed all strategies: {last_err}")
+
 # ── Azure OpenAI (Responses API) ─────────────────────────────────────────────
 OPENAI_URL = "https://openaiyoutube.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
 
@@ -265,10 +433,14 @@ def generate_insights(transcript, title):
     ctx = f'Video title: "{title}"\n\n' if title else ""
     t = transcript[:12000]
     prompts = [
-        ("You are an expert media analyst. Produce a concise 3-5 sentence summary of the key points discussed.", f"{ctx}Transcript:\n{t}"),
-        ('Analyze and return ONLY valid JSON (no markdown): {"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}', f"{ctx}Transcript:\n{t}"),
-        ("Produce detailed expanded notes with sections: ## Main Topics, ## Key Claims, ## Notable Quotes, ## Action Items, ## Unanswered Questions", f"{ctx}Transcript:\n{t}"),
-        ('Analyze for clues about when content was produced. Return ONLY valid JSON (no markdown): {"likely_production_date":"<date range>","reasoning":"<brief>"}', f"{ctx}Transcript:\n{transcript[:8000]}"),
+        ("You are an expert media analyst. Produce a concise 3-5 sentence summary of the key points discussed.",
+         f"{ctx}Transcript:\n{t}"),
+        ('Analyze and return ONLY valid JSON (no markdown): {"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}',
+         f"{ctx}Transcript:\n{t}"),
+        ("Produce detailed expanded notes with sections: ## Main Topics, ## Key Claims, ## Notable Quotes, ## Action Items, ## Unanswered Questions",
+         f"{ctx}Transcript:\n{t}"),
+        ('Analyze for clues about when content was produced. Return ONLY valid JSON (no markdown): {"likely_production_date":"<date range>","reasoning":"<brief>"}',
+         f"{ctx}Transcript:\n{transcript[:8000]}"),
     ]
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -298,58 +470,6 @@ def generate_insights(transcript, title):
         "likely_production_date": likely_date, "production_date_reasoning": date_reasoning,
     }
 
-# ── yt-dlp download with bot-detection workarounds ──────────────────────────
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-def download_audio(youtube_url, audio_path):
-    """Try multiple yt-dlp strategies to handle YouTube bot detection."""
-    strategies = [
-        # Strategy 1: web_creator client (least likely to trigger bot detection)
-        ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
-         "--audio-quality", "96K",
-         "--extractor-args", "youtube:player_client=web_creator",
-         "--user-agent", USER_AGENT,
-         "--no-check-certificates",
-         "-o", audio_path, youtube_url],
-        # Strategy 2: mediaconnect client
-        ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
-         "--audio-quality", "96K",
-         "--extractor-args", "youtube:player_client=mediaconnect",
-         "--user-agent", USER_AGENT,
-         "--no-check-certificates",
-         "-o", audio_path, youtube_url],
-        # Strategy 3: android_vr client + geo bypass
-        ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
-         "--audio-quality", "96K",
-         "--extractor-args", "youtube:player_client=android_vr",
-         "--user-agent", USER_AGENT,
-         "--geo-bypass",
-         "--no-check-certificates",
-         "-o", audio_path, youtube_url],
-        # Strategy 4: default with geo bypass
-        ["yt-dlp", "--no-playlist", "-x", "--audio-format", "mp3",
-         "--audio-quality", "96K",
-         "--user-agent", USER_AGENT,
-         "--geo-bypass",
-         "--no-check-certificates",
-         "-o", audio_path, youtube_url],
-    ]
-    last_err = ""
-    for i, cmd in enumerate(strategies):
-        client = cmd[cmd.index("--extractor-args") + 1].split("=")[1] if "--extractor-args" in cmd else "default"
-        print(f"[worker] Download attempt {i+1}/4 (client={client})")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0 and os.path.exists(audio_path):
-            print(f"[worker] Download succeeded with strategy {i+1}")
-            return
-        last_err = result.stderr
-        print(f"[worker] Strategy {i+1} failed: {last_err[:200]}")
-        # Clean up partial file
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
-    raise RuntimeError(f"yt-dlp failed all strategies: {last_err}")
-
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 MAX_FAST_TRANSCRIBE_SIZE = 200 * 1024 * 1024
 
@@ -359,82 +479,105 @@ def run_pipeline(record):
     title = record.get("title")
     user_id = record.get("user_id")
     t_start = time.time()
-
     print(f"[worker] Starting pipeline for {analysis_id}")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        audio_path = f"{tmp}/audio.mp3"
-        blob_name = f"{analysis_id}.mp3"
-
-        try:
-            # 1. Download audio
+    try:
+        # ── TRACK 1: Try YouTube transcript API (fast, no download) ──────
+        video_id = extract_video_id(youtube_url)
+        yt_transcript = None
+        if video_id:
             set_status(analysis_id, "extracting")
-            t0 = time.time()
-            download_audio(youtube_url, audio_path)
-            file_size = os.path.getsize(audio_path)
-            print(f"[worker] Downloaded audio in {time.time()-t0:.1f}s ({file_size/1024/1024:.1f}MB)")
+            yt_transcript = fetch_youtube_transcript(video_id)
 
-            # 2. Transcription
+        if yt_transcript and len(yt_transcript) > 5:
+            print(f"[worker] Using YouTube transcript ({len(yt_transcript)} segments)")
             set_status(analysis_id, "transcribing")
-            t0 = time.time()
-            use_fast = file_size < MAX_FAST_TRANSCRIBE_SIZE
-            if use_fast:
-                try:
-                    result_data = fast_transcribe(audio_path, analysis_id)
-                    utterances = parse_fast_utterances(result_data)
-                    print(f"[worker] Fast transcription: {len(utterances)} utterances in {time.time()-t0:.1f}s")
-                except Exception as e:
-                    print(f"[worker] Fast transcription failed, falling back to batch: {e}")
-                    use_fast = False
 
-            if not use_fast:
-                print(f"[worker] Using batch transcription (file={file_size/1024/1024:.1f}MB)")
-                upload_blob(audio_path, blob_name)
-                sas_url = generate_sas_url(blob_name)
-                job_url = submit_transcription_job(sas_url, analysis_id)
-                job_data = poll_transcription_job(job_url)
-                result_data = fetch_transcription_results(job_data)
-                utterances = parse_batch_utterances(result_data)
-                print(f"[worker] Batch transcription: {len(utterances)} utterances in {time.time()-t0:.1f}s")
+            # Build utterances from YouTube transcript (no speaker diarization)
+            utterances = [
+                {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
+                for seg in yt_transcript
+            ]
+            polished = "\n".join(seg["text"] for seg in yt_transcript)
+            raw_data = {"source": "youtube_captions", "segments": yt_transcript}
+            used_yt_captions = True
 
-            polished = "\n".join(f"[{u['speaker']}]: {u['text']}" for u in utterances)
+        else:
+            # ── TRACK 2: yt-dlp download + Azure Speech ─────────────────
+            print("[worker] No YouTube transcript available, trying yt-dlp download...")
+            used_yt_captions = False
 
-            # 3. AI insights (parallel)
-            set_status(analysis_id, "processing")
-            insights = generate_insights(polished, title)
+            with tempfile.TemporaryDirectory() as tmp:
+                audio_path = f"{tmp}/audio.mp3"
+                blob_name = f"{analysis_id}.mp3"
 
-            # 4. Update analyses
-            sb_patch("analyses", {"id": analysis_id}, {
-                "status": "complete",
-                "raw_transcript": result_data,
-                "polished_transcript": polished,
-                **insights,
-            })
+                set_status(analysis_id, "extracting")
+                t0 = time.time()
+                download_audio(youtube_url, audio_path)
+                file_size = os.path.getsize(audio_path)
+                print(f"[worker] Downloaded audio in {time.time()-t0:.1f}s ({file_size/1024/1024:.1f}MB)")
 
-            # 5. Insert utterances
-            if utterances:
-                rows = [
-                    {"user_id": user_id, "analysis_id": analysis_id,
-                     "diarization_label": u["speaker"],
-                     "start_seconds": u["start"], "end_seconds": u["end"],
-                     "text": u["text"]}
-                    for u in utterances
-                ]
-                for i in range(0, len(rows), 500):
-                    sb_insert("speaker_utterances", rows[i:i+500])
+                set_status(analysis_id, "transcribing")
+                t0 = time.time()
+                use_fast = file_size < MAX_FAST_TRANSCRIBE_SIZE
+                if use_fast:
+                    try:
+                        result_data = fast_transcribe(audio_path, analysis_id)
+                        utterances = parse_fast_utterances(result_data)
+                        print(f"[worker] Fast transcription: {len(utterances)} utterances in {time.time()-t0:.1f}s")
+                    except Exception as e:
+                        print(f"[worker] Fast transcription failed, falling back to batch: {e}")
+                        use_fast = False
 
-            total = time.time() - t_start
-            print(f"[worker] Pipeline complete in {total:.1f}s for {analysis_id}")
+                if not use_fast:
+                    print(f"[worker] Using batch transcription (file={file_size/1024/1024:.1f}MB)")
+                    upload_blob(audio_path, blob_name)
+                    sas_url = generate_sas_url(blob_name)
+                    job_url = submit_transcription_job(sas_url, analysis_id)
+                    job_data = poll_transcription_job(job_url)
+                    result_data = fetch_transcription_results(job_data)
+                    utterances = parse_batch_utterances(result_data)
+                    print(f"[worker] Batch transcription: {len(utterances)} utterances in {time.time()-t0:.1f}s")
 
-        except Exception as e:
-            fail_analysis(analysis_id, str(e))
+                polished = "\n".join(f"[{u['speaker']}]: {u['text']}" for u in utterances)
+                raw_data = result_data
+
+        # ── AI Insights (parallel, same for both tracks) ─────────────
+        set_status(analysis_id, "processing")
+        insights = generate_insights(polished, title)
+
+        # ── Update database ──────────────────────────────────────────
+        sb_patch("analyses", {"id": analysis_id}, {
+            "status": "complete",
+            "raw_transcript": raw_data,
+            "polished_transcript": polished,
+            **insights,
+        })
+
+        if utterances:
+            rows = [
+                {"user_id": user_id, "analysis_id": analysis_id,
+                 "diarization_label": u["speaker"],
+                 "start_seconds": u["start"], "end_seconds": u["end"],
+                 "text": u["text"]}
+                for u in utterances
+            ]
+            for i in range(0, len(rows), 500):
+                sb_insert("speaker_utterances", rows[i:i+500])
+
+        total = time.time() - t_start
+        source = "YouTube captions" if used_yt_captions else "Azure Speech"
+        print(f"[worker] Pipeline complete in {total:.1f}s ({source}) for {analysis_id}")
+
+    except Exception as e:
+        fail_analysis(analysis_id, str(e))
 
 # ── HTTP Server ───────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b'{"status":"ok"}')
+        self.wfile.write(b'{"status":"ok","version":"v3"}')
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -465,5 +608,5 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[http] {args[0]} {args[1]}")
 
 if __name__ == "__main__":
-    print(f"[worker] v2 Listening on port {PORT}")
+    print(f"[worker] v3 Listening on port {PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
