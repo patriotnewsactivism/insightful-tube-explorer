@@ -1,11 +1,49 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { SiteHeader } from "@/components/SiteHeader";
 import { Button } from "@/components/ui/button";
-import { ArrowRight, Mic, FileText, Users, Download, Brain, Clock, Zap } from "lucide-react";
+import { ArrowRight, Mic, FileText, Users, Download, Brain, Clock, Zap, Plus } from "lucide-react";
 
 export const Route = createFileRoute("/")(
   { component: Landing }
 );
+
+const FAQ_ITEMS = [
+  {
+    question: "Does it work with any YouTube video?",
+    answer:
+      "Yes \u2014 any public YouTube video or playlist with available audio. Paste the URL and TubeScribe handles the rest. We support single videos and full playlists, processing each video in parallel.",
+  },
+  {
+    question: "How accurate is the transcription?",
+    answer:
+      "TubeScribe uses state-of-the-art AI models for transcription and speaker diarization. Accuracy is typically 95%+ for clear audio in English, with strong support for 40+ languages. Audio quality and background noise are the main factors that affect accuracy.",
+  },
+  {
+    question: "What makes this different from YouTube\u2019s built-in captions?",
+    answer:
+      "YouTube captions give you raw, unformatted text with no speaker labels and no analysis. TubeScribe gives you speaker-diarized transcripts, AI summaries, section-level sentiment analysis, key claims and quotes extraction, and export-ready documents in PDF, Word, Markdown, or plain text.",
+  },
+  {
+    question: "How does speaker diarization work?",
+    answer:
+      "Our AI identifies distinct speakers in the audio and labels each segment. With Voice Memory, speaker profiles persist across videos \u2014 label a speaker once and TubeScribe recognizes them in every future analysis. Perfect for tracking recurring speakers across interview series, podcasts, or hearings.",
+  },
+  {
+    question: "Is my data private and secure?",
+    answer:
+      "Yes. Your analyses are private to your account. We don\u2019t share your data with third parties, and you can delete your analyses at any time. All data is transmitted over encrypted connections.",
+  },
+  {
+    question: "What happens after my 3 free analyses?",
+    answer:
+      "Your 3 free analyses let you experience the full product with no restrictions. After that, you can upgrade to a paid plan for unlimited analyses. We\u2019ll show you pricing options in your dashboard \u2014 no surprise charges.",
+  },
+  {
+    question: "What export formats are available?",
+    answer:
+      "Export your transcripts and analyses as PDF, Word (.docx), Markdown, or plain text. Bulk export is available for entire research projects \u2014 select multiple analyses and download them all at once.",
+  },
+];
 
 function Landing() {
   return (
@@ -36,7 +74,7 @@ function Landing() {
             </Button>
           </div>
           <p className="mt-3 text-xs text-muted-foreground">
-            3 free analyses · No credit card required
+            3 free analyses &middot; No credit card required
           </p>
         </section>
 
@@ -47,7 +85,7 @@ function Landing() {
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             {[
-              { step: "1", title: "Paste a link", body: "Drop any YouTube URL — single video or playlist. We handle the rest." },
+              { step: "1", title: "Paste a link", body: "Drop any YouTube URL \u2014 single video or playlist. We handle the rest." },
               { step: "2", title: "AI processes", body: "Speaker diarization, transcription, summary, sentiment, and date analysis run in parallel." },
               { step: "3", title: "Export & cite", body: "Download polished transcripts as PDF, Word, or plain text. Ready for your research." },
             ].map((s) => (
@@ -67,7 +105,7 @@ function Landing() {
             { icon: FileText, title: "AI summary & sentiment", body: "Executive summary plus section-level sentiment you can skim in seconds." },
             { icon: Users, title: "Voice memory", body: "Speaker profiles persist across videos. Label once, recognize forever." },
             { icon: Clock, title: "Production date detection", body: "AI infers the likely recording date from title, description, and transcript context clues." },
-            { icon: Brain, title: "Deep analysis", body: "Key claims, notable quotes, action items, and unanswered questions — all extracted automatically." },
+            { icon: Brain, title: "Deep analysis", body: "Key claims, notable quotes, action items, and unanswered questions \u2014 all extracted automatically." },
             { icon: Download, title: "Export everything", body: "PDF, Word, Markdown, or plain text. Bulk export for entire research projects." },
           ].map((f) => (
             <div key={f.title} className="rounded-xl border border-border bg-surface/40 p-6 hover:bg-surface/70 transition-colors">
@@ -76,6 +114,31 @@ function Landing() {
               <p className="text-sm text-muted-foreground leading-relaxed">{f.body}</p>
             </div>
           ))}
+        </section>
+
+        {/* FAQ */}
+        <section className="pb-24">
+          <div className="text-center mb-12">
+            <h2 className="font-display text-3xl font-bold tracking-tight">
+              Frequently asked questions
+            </h2>
+            <p className="mx-auto mt-4 max-w-lg text-muted-foreground leading-relaxed">
+              Everything you need to know about TubeScribe.
+            </p>
+          </div>
+          <div className="mx-auto max-w-2xl divide-y divide-border">
+            {FAQ_ITEMS.map((faq, i) => (
+              <details key={i} className="group py-5" {...(i === 0 ? { open: true } : {})}>
+                <summary className="flex cursor-pointer list-none items-center justify-between text-left font-display font-semibold leading-snug [&::-webkit-details-marker]:hidden">
+                  {faq.question}
+                  <Plus className="ml-4 h-5 w-5 shrink-0 text-muted-foreground transition-transform duration-200 group-open:rotate-45" />
+                </summary>
+                <p className="mt-3 text-sm text-muted-foreground leading-relaxed">
+                  {faq.answer}
+                </p>
+              </details>
+            ))}
+          </div>
         </section>
 
         {/* CTA */}
