@@ -23,6 +23,7 @@ export type Database = {
           expanded_notes: string | null
           id: string
           likely_production_date: string | null
+          pasted_transcript: string | null
           polished_transcript: string | null
           production_date_reasoning: string | null
           published_at: string | null
@@ -45,6 +46,7 @@ export type Database = {
           expanded_notes?: string | null
           id?: string
           likely_production_date?: string | null
+          pasted_transcript?: string | null
           polished_transcript?: string | null
           production_date_reasoning?: string | null
           published_at?: string | null
@@ -67,6 +69,7 @@ export type Database = {
           expanded_notes?: string | null
           id?: string
           likely_production_date?: string | null
+          pasted_transcript?: string | null
           polished_transcript?: string | null
           production_date_reasoning?: string | null
           published_at?: string | null
