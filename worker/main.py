@@ -89,49 +89,62 @@ def extract_video_id(url):
     return None
 
 # ── Supadata API (primary transcript source) ─────────────────────────────────
+def _supadata_curl(url):
+    """Call Supadata API via curl to bypass Cloudflare bot detection on urllib."""
+    cmd = [
+        "curl", "-s", "-m", "30",
+        "-H", f"x-api-key: {SUPADATA_API_KEY}",
+        "-H", "Accept: application/json",
+        "-H", "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        url,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+        if result.returncode != 0:
+            print(f"[worker] Supadata curl failed (rc={result.returncode}): {result.stderr[:200]}")
+            return None
+        body = result.stdout.strip()
+        if not body:
+            print("[worker] Supadata curl returned empty body")
+            return None
+        return json.loads(body)
+    except subprocess.TimeoutExpired:
+        print("[worker] Supadata curl timed out")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"[worker] Supadata curl JSON error: {e}, body: {result.stdout[:200]}")
+        return None
+    except Exception as e:
+        print(f"[worker] Supadata curl exception: {e}")
+        return None
+
+
 def fetch_supadata_transcript(video_id):
     """Fetch transcript via Supadata API — handles YouTube bot detection bypass."""
     if not SUPADATA_API_KEY:
         print("[worker] No SUPADATA_API_KEY set, skipping Supadata")
         return None, None, None
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
     print(f"[worker] Fetching transcript via Supadata API for {video_id}")
 
-    # Step 1: Get transcript (structured with timestamps)
-    transcript_url = f"https://api.supadata.ai/v1/youtube/transcript?url={quote(url, safe='')}"
-    req = Request(transcript_url, headers={
-        "x-api-key": SUPADATA_API_KEY,
-        "Accept": "application/json",
-    })
-    transcript_data = None
-    try:
-        resp = urlopen(req, timeout=30)
-        transcript_data = json.loads(resp.read())
+    # Step 1: Get transcript (structured with timestamps) — use videoId param
+    transcript_url = f"https://api.supadata.ai/v1/youtube/transcript?videoId={video_id}&lang=en"
+    transcript_data = _supadata_curl(transcript_url)
+    if transcript_data:
         print(f"[worker] Supadata transcript response type: {type(transcript_data).__name__}")
-    except HTTPError as e:
-        body = e.read().decode()
-        print(f"[worker] Supadata transcript error ({e.status}): {body[:200]}")
-        if e.status == 402:
-            print("[worker] Supadata credits exhausted")
-        return None, None, None
-    except Exception as e:
-        print(f"[worker] Supadata transcript fetch failed: {e}")
+        if isinstance(transcript_data, dict) and "error" in transcript_data:
+            print(f"[worker] Supadata API error: {transcript_data}")
+            return None, None, None
+    else:
+        print("[worker] Supadata transcript fetch failed")
         return None, None, None
 
     # Step 2: Get video metadata (title, description)
-    video_info_url = f"https://api.supadata.ai/v1/youtube/video?url={quote(url, safe='')}"
-    req2 = Request(video_info_url, headers={
-        "x-api-key": SUPADATA_API_KEY,
-        "Accept": "application/json",
-    })
-    video_info = {}
-    try:
-        resp2 = urlopen(req2, timeout=15)
-        video_info = json.loads(resp2.read())
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+    video_info_url = f"https://api.supadata.ai/v1/youtube/video?url={quote(yt_url, safe='')}"
+    video_info = _supadata_curl(video_info_url) or {}
+    if video_info:
         print(f"[worker] Supadata video info: title={video_info.get('title', 'N/A')[:60]}")
-    except Exception as e:
-        print(f"[worker] Supadata video info failed (non-fatal): {e}")
 
     return transcript_data, video_info, "supadata"
 
