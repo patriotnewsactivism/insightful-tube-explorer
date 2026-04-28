@@ -513,7 +513,7 @@ OPENAI_URL = "https://openaiyoutube.openai.azure.com/openai/responses?api-versio
 def call_openai(instructions, input_text):
     body = {
         "model": AZURE_OPENAI_DEPLOYMENT, "instructions": instructions,
-        "input": input_text, "max_output_tokens": 2000, "temperature": 0.3,
+        "input": input_text, "max_output_tokens": 2000,
     }
     req = Request(OPENAI_URL, data=json.dumps(body).encode(), headers={
         "api-key": AZURE_OPENAI_KEY, "Content-Type": "application/json",
