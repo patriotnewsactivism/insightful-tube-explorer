@@ -147,26 +147,35 @@ def parse_supadata_transcript(transcript_data):
 
     # Handle different response formats
     if isinstance(transcript_data, list):
-        # Structured format: [{text, start, duration}, ...]
+        # Structured format: [{text, start/offset, duration}, ...]
+        # Detect if values are in milliseconds by checking first item
+        is_ms = False
+        for item in transcript_data[:5]:
+            if isinstance(item, dict):
+                val = item.get("offset", item.get("startMs", 0))
+                if val and float(val) > 500:
+                    is_ms = True
+                    break
         for item in transcript_data:
             if isinstance(item, dict):
                 text = item.get("text", "").strip()
                 if not text:
                     continue
-                start = float(item.get("start", item.get("startMs", 0)))
-                # If startMs is in milliseconds, convert
-                if start > 100000:
-                    start = start / 1000.0
-                duration = float(item.get("duration", item.get("dur", 3)))
-                if duration > 100000:
-                    duration = duration / 1000.0
+                raw_start = float(item.get("start", item.get("offset", item.get("startMs", 0))))
+                raw_dur = float(item.get("duration", item.get("dur", 3000 if is_ms else 3)))
+                if is_ms:
+                    start = raw_start / 1000.0
+                    duration = raw_dur / 1000.0
+                else:
+                    start = raw_start
+                    duration = raw_dur
                 segments.append({
                     "text": text,
                     "start": start,
                     "end": start + duration,
                 })
         if segments:
-            print(f"[worker] Parsed {len(segments)} structured Supadata segments")
+            print(f"[worker] Parsed {len(segments)} structured Supadata segments (ms={is_ms})")
             return segments
 
     elif isinstance(transcript_data, dict):
