@@ -510,10 +510,10 @@ def parse_fast_utterances(result):
 # ── Azure OpenAI ─────────────────────────────────────────────────────────────
 OPENAI_URL = "https://openaiyoutube.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
 
-def call_openai(instructions, input_text):
+def call_openai(instructions, input_text, max_tokens=2000):
     body = {
         "model": AZURE_OPENAI_DEPLOYMENT, "instructions": instructions,
-        "input": input_text, "max_output_tokens": 2000,
+        "input": input_text, "max_output_tokens": max_tokens,
     }
     req = Request(OPENAI_URL, data=json.dumps(body).encode(), headers={
         "api-key": AZURE_OPENAI_KEY, "Content-Type": "application/json",
@@ -529,11 +529,27 @@ def call_openai(instructions, input_text):
                     return block["text"]
     return data.get("output_text", "")
 
-def generate_insights(transcript, title, description=""):
+def get_known_speakers(user_id):
+    """Fetch known speakers for this user to help with identification."""
+    try:
+        rows = sb_get("speakers", {"user_id": user_id}, "id,name,channel,notes")
+        return rows if rows else []
+    except Exception:
+        return []
+
+def generate_insights(transcript, title, description="", user_id=None):
     ctx = f'Video title: "{title}"\n\n' if title else ""
     if description:
         ctx += f'Video description: "{description[:500]}"\n\n'
     t = transcript[:12000]
+
+    # Get known speakers for context
+    known_speakers = get_known_speakers(user_id) if user_id else []
+    speaker_ctx = ""
+    if known_speakers:
+        names = ", ".join(s["name"] for s in known_speakers[:20])
+        speaker_ctx = f"\n\nKnown speakers from previous videos: {names}. Try to match voices/speakers to these known people if they appear in this video."
+
     prompts = [
         ("You are an expert media analyst. Produce a concise 3-5 sentence summary of the key points discussed.",
          f"{ctx}Transcript:\n{t}"),
@@ -543,13 +559,33 @@ def generate_insights(transcript, title, description=""):
          f"{ctx}Transcript:\n{t}"),
         ('Analyze for clues about when content was produced. Return ONLY valid JSON (no markdown): {"likely_production_date":"<date range>","reasoning":"<brief>"}',
          f"{ctx}Transcript:\n{transcript[:8000]}"),
+        # 5th call: Speaker-aware polished transcript
+        (f'''You are an expert transcript editor. Create a polished, readable version of this transcript.
+
+Rules:
+1. Identify different speakers from context clues (names mentioned, "I", "you", conversation flow, who is recording, etc.)
+2. Label each speaker with their likely real name if identifiable, otherwise "Speaker 1", "Speaker 2", etc.
+3. Fix obvious transcription errors, grammar issues, and filler words (um, uh, like)
+4. Add paragraph breaks at natural topic shifts
+5. Keep the meaning 100% accurate — never change what was said, only how it reads
+6. Format as: **Speaker Name:** Their dialogue here...
+7. Add [timestamp] markers every few paragraphs if timing info is available{speaker_ctx}
+
+Return ONLY the polished transcript text, no other commentary.''',
+         f"{ctx}Transcript:\n{transcript[:14000]}"),
+        # 6th call: Speaker identification JSON
+        (f'''Identify all speakers in this transcript. Return ONLY valid JSON (no markdown):
+{{"speakers": [{{"label": "Speaker 1", "likely_name": "name or null", "role": "brief role description", "speaking_percentage": 0-100, "key_quotes": ["notable quote 1"]}}]}}
+
+Look for: names mentioned in conversation, self-references, titles, the video creator/recorder.{speaker_ctx}''',
+         f"{ctx}Transcript:\n{t}"),
     ]
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(call_openai, p[0], p[1]) for p in prompts]
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(call_openai, p[0], p[1], 4000 if i == 4 else 2000) for i, p in enumerate(prompts)]
         results = [f.result() for f in futures]
-    print(f"[worker] 4 OpenAI calls completed in {time.time()-t0:.1f}s (parallel)")
-    summary, sentiment_raw, notes, date_raw = results
+    print(f"[worker] 6 OpenAI calls completed in {time.time()-t0:.1f}s (parallel)")
+    summary, sentiment_raw, notes, date_raw, polished_text, speakers_raw = results
 
     try:
         m = re.search(r"\{[\s\S]*\}", sentiment_raw)
@@ -567,9 +603,20 @@ def generate_insights(transcript, title, description=""):
     except Exception:
         likely_date, date_reasoning = "Unknown", date_raw
 
+    # Parse speaker identification
+    speakers_info = []
+    try:
+        m = re.search(r"\{[\s\S]*\}", speakers_raw)
+        if m:
+            speakers_info = json.loads(m.group()).get("speakers", [])
+    except Exception:
+        pass
+
     return {
         "summary": summary, "sentiment": sentiment, "expanded_notes": notes,
         "likely_production_date": likely_date, "production_date_reasoning": date_reasoning,
+        "polished_transcript": polished_text,
+        "speakers_info": speakers_info,
     }
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
@@ -678,15 +725,21 @@ def run_pipeline(record):
 
         # ── AI Insights ──
         set_status(analysis_id, "processing")
-        insights = generate_insights(polished, title, description)
+        insights = generate_insights(polished, title, description, user_id=user_id)
+
+        # Extract speakers_info before saving (not a DB column)
+        speakers_info = insights.pop("speakers_info", [])
 
         # ── Save ──
         sb_patch("analyses", {"id": analysis_id}, {
             "status": "complete",
-            "raw_transcript": raw_data,
-            "polished_transcript": polished,
+            "raw_transcript": {**raw_data, "speakers_info": speakers_info},
             **insights,
         })
+
+        # ── Save/update known speakers ──
+        if speakers_info and user_id:
+            save_identified_speakers(user_id, analysis_id, speakers_info)
 
         if utterances:
             rows = [
@@ -705,14 +758,129 @@ def run_pipeline(record):
     except Exception as e:
         fail_analysis(analysis_id, str(e))
 
+# ── Speaker persistence ───────────────────────────────────────────────────────
+def save_identified_speakers(user_id, analysis_id, speakers_info):
+    """Save newly identified speakers to the speakers table."""
+    try:
+        existing = get_known_speakers(user_id)
+        existing_names = {s["name"].lower() for s in existing}
+        for sp in speakers_info:
+            name = sp.get("likely_name") or sp.get("label", "Unknown")
+            if name.lower() in existing_names or name.lower().startswith("speaker "):
+                continue
+            sb_insert("speakers", [{
+                "user_id": user_id,
+                "name": name,
+                "channel": sp.get("role", ""),
+                "notes": f"First seen in analysis {analysis_id}. {sp.get('role', '')}",
+            }])
+            existing_names.add(name.lower())
+            print(f"[worker] New speaker saved: {name}")
+    except Exception as e:
+        print(f"[worker] Speaker save error: {e}")
+
+# ── AI Chat endpoint ──────────────────────────────────────────────────────────
+def handle_chat(data):
+    """Process an AI chat message about a video analysis."""
+    analysis_id = data.get("analysis_id")
+    message = data.get("message", "")
+    user_id = data.get("user_id")
+
+    if not analysis_id or not message:
+        return {"error": "analysis_id and message are required"}
+
+    # Load analysis data
+    rows = sb_get("analyses", {"id": analysis_id})
+    if not rows:
+        return {"error": "Analysis not found"}
+    analysis = rows[0]
+
+    # Load utterances
+    utts = sb_get("speaker_utterances", {"analysis_id": analysis_id}, "text,diarization_label,start_seconds")
+
+    # Build context
+    context = f"""Video: "{analysis.get('title', 'Unknown')}"
+Channel: {analysis.get('channel', 'Unknown')}
+Likely recorded: {analysis.get('likely_production_date', 'Unknown')}
+Date reasoning: {analysis.get('production_date_reasoning', '')}
+
+Summary: {analysis.get('summary', '')}
+
+Polished Transcript:
+{(analysis.get('polished_transcript') or '')[:8000]}
+
+Notes:
+{(analysis.get('expanded_notes') or '')[:4000]}
+"""
+
+    instructions = f"""You are TubeScribe AI assistant. The user is chatting about a specific video analysis.
+You have access to the video's transcript, summary, notes, date info, and speaker data.
+
+When the user asks you to UPDATE something (date, speaker name, notes, transcript detail), you should:
+1. Make the change
+2. Return your response with a JSON block at the end like:
+   ```json
+   {{"updates": {{"field_name": "new_value"}}}}
+   ```
+   Valid fields: likely_production_date, production_date_reasoning, expanded_notes, polished_transcript, summary
+
+If the user is just asking a question (not requesting changes), just answer naturally without the JSON block.
+
+Be helpful, conversational, and accurate. Reference specific parts of the transcript when relevant."""
+
+    try:
+        response = call_openai(instructions, f"Video context:\n{context}\n\nUser message: {message}", max_tokens=3000)
+
+        # Check for updates in the response
+        update_match = re.search(r'```json\s*(\{[\s\S]*?\})\s*```', response)
+        updates_applied = {}
+        if update_match:
+            try:
+                update_data = json.loads(update_match.group(1))
+                updates = update_data.get("updates", {})
+                valid_fields = {"likely_production_date", "production_date_reasoning", "expanded_notes", "polished_transcript", "summary"}
+                clean_updates = {k: v for k, v in updates.items() if k in valid_fields}
+                if clean_updates:
+                    sb_patch("analyses", {"id": analysis_id}, clean_updates)
+                    updates_applied = clean_updates
+                    print(f"[chat] Updated fields: {list(clean_updates.keys())} for {analysis_id}")
+            except Exception as e:
+                print(f"[chat] Update parse error: {e}")
+
+            # Clean the JSON block from the user-facing response
+            clean_response = response[:update_match.start()].strip()
+            if not clean_response:
+                clean_response = "Done! I've updated that for you."
+        else:
+            clean_response = response
+
+        return {
+            "response": clean_response,
+            "updates_applied": updates_applied,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 # ── HTTP Server ───────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
+    def _cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors_headers()
+        self.end_headers()
+
     def do_GET(self):
         supadata = "yes" if SUPADATA_API_KEY else "no"
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps({
-            "status": "ok", "version": "v6", "supadata": supadata
+            "status": "ok", "version": "v7", "supadata": supadata
         }).encode())
 
     def do_POST(self):
@@ -722,12 +890,37 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body)
         except Exception:
             self.send_response(400)
+            self._cors_headers()
             self.end_headers()
             return
 
+        path = self.path.rstrip("/")
+
+        # ── Chat endpoint ──
+        if path == "/chat":
+            result = handle_chat(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── Export endpoint ──
+        if path == "/export":
+            result = handle_export(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── Default: webhook trigger ──
         record = payload.get("record", payload)
         if record.get("status", "pending") != "pending":
             self.send_response(200)
+            self._cors_headers()
             self.end_headers()
             self.wfile.write(b'{"ok":true,"skipped":true}')
             return
@@ -737,13 +930,93 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps({"ok": True, "id": record.get("id")}).encode())
 
     def log_message(self, format, *args):
         print(f"[http] {args[0]} {args[1]}")
 
+def handle_export(data):
+    """Generate a comprehensive export of the analysis."""
+    analysis_id = data.get("analysis_id")
+    if not analysis_id:
+        return {"error": "analysis_id required"}
+    rows = sb_get("analyses", {"id": analysis_id})
+    if not rows:
+        return {"error": "Analysis not found"}
+    a = rows[0]
+    utts = sb_get("speaker_utterances", {"analysis_id": analysis_id}, "text,diarization_label,start_seconds,end_seconds")
+
+    speakers_info = []
+    raw = a.get("raw_transcript")
+    if isinstance(raw, dict):
+        speakers_info = raw.get("speakers_info", [])
+
+    sections = []
+    sections.append(f"# {a.get('title', 'Untitled Video')}")
+    sections.append(f"Channel: {a.get('channel', 'Unknown')}")
+    sections.append(f"URL: {a.get('youtube_url', '')}")
+    if a.get("likely_production_date"):
+        sections.append(f"Likely Recorded: {a['likely_production_date']}")
+        if a.get("production_date_reasoning"):
+            sections.append(f"Date Evidence: {a['production_date_reasoning']}")
+    sections.append(f"Analyzed: {a.get('created_at', '')[:10]}")
+    sections.append("")
+
+    # Summary
+    sections.append("## Summary")
+    sections.append(a.get("summary", "N/A"))
+    sections.append("")
+
+    # Sentiment
+    sections.append("## Sentiment Analysis")
+    sent = a.get("sentiment", {})
+    if isinstance(sent, dict):
+        sections.append(f"Overall: {sent.get('overall', 'N/A')}")
+        if sent.get("score") is not None:
+            sections.append(f"Score: {sent['score']} (-1 to +1)")
+        if sent.get("tone"):
+            sections.append(f"Tone: {sent['tone']}")
+        if sent.get("key_emotions"):
+            sections.append(f"Key Emotions: {', '.join(sent['key_emotions'])}")
+    sections.append("")
+
+    # Speakers
+    if speakers_info:
+        sections.append("## Identified Speakers")
+        for sp in speakers_info:
+            name = sp.get("likely_name") or sp.get("label", "Unknown")
+            role = sp.get("role", "")
+            pct = sp.get("speaking_percentage", "")
+            sections.append(f"- **{name}**: {role} ({pct}% of dialogue)")
+        sections.append("")
+
+    # Polished Transcript
+    sections.append("## Polished Transcript")
+    sections.append(a.get("polished_transcript", "N/A"))
+    sections.append("")
+
+    # Speaker Utterances (raw with timestamps)
+    if utts:
+        sections.append("## Raw Speaker Transcript (with timestamps)")
+        for u in sorted(utts, key=lambda x: x.get("start_seconds") or 0):
+            ts = ""
+            if u.get("start_seconds") is not None:
+                m = int(u["start_seconds"] // 60)
+                s = int(u["start_seconds"] % 60)
+                ts = f"[{m}:{s:02d}] "
+            label = u.get("diarization_label", "Speaker")
+            sections.append(f"{ts}{label}: {u['text']}")
+        sections.append("")
+
+    # Notes
+    sections.append("## Expanded Notes")
+    sections.append(a.get("expanded_notes", "N/A"))
+
+    return {"text": "\n".join(sections), "title": a.get("title", "export")}
+
 if __name__ == "__main__":
-    print(f"[worker] v6 — Supadata: {'enabled' if SUPADATA_API_KEY else 'not configured'}")
+    print(f"[worker] v7 — Supadata: {'enabled' if SUPADATA_API_KEY else 'not configured'}")
     print(f"[worker] Listening on port {PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
