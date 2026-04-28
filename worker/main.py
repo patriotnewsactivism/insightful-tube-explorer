@@ -1392,6 +1392,20 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode())
             return
 
+        # ── Reprocess insights endpoint ──
+        if path == "/reprocess-insights":
+            import threading
+            def _reprocess():
+                result = handle_reprocess_insights(payload)
+                print(f"[reprocess] Result: {json.dumps(result)[:200]}")
+            threading.Thread(target=_reprocess, daemon=True).start()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "processing": payload.get("analysis_id")}).encode())
+            return
+
         # ── Export endpoint ──
         if path == "/export":
             result = handle_export(payload)
@@ -1422,6 +1436,56 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         print(f"[http] {args[0]} {args[1]}")
+
+
+def handle_reprocess_insights(data):
+    """Re-run AI insights on an existing analysis using stored transcript data."""
+    analysis_id = data.get("analysis_id")
+    if not analysis_id:
+        return {"error": "analysis_id required"}
+    
+    rows = sb_get("analyses", {"id": analysis_id}, "title,user_id,polished_transcript,expanded_notes,summary")
+    if not rows:
+        return {"error": "analysis not found"}
+    
+    row = rows[0]
+    title = row.get("title", "")
+    user_id = row.get("user_id")
+    
+    # Get transcript from speaker_utterances
+    utts = sb_get("speaker_utterances", {"analysis_id": analysis_id}, "text")
+    transcript = "\n".join(u["text"] for u in utts) if utts else ""
+    
+    if not transcript or len(transcript) < 50:
+        # Fall back to polished_transcript
+        pt = row.get("polished_transcript", "")
+        if pt and len(pt) > 50:
+            transcript = pt
+    
+    if not transcript or len(transcript) < 50:
+        return {"error": f"no transcript data found ({len(transcript)} chars)"}
+    
+    print(f"[reprocess] Starting insights for {analysis_id[:8]} ({len(transcript)} chars)")
+    set_status(analysis_id, "processing")
+    
+    try:
+        insights = generate_insights(transcript, title, user_id=user_id)
+        speakers_info = insights.pop("speakers_info", [])
+        
+        sb_patch("analyses", {"id": analysis_id}, {
+            "status": "complete",
+            "error_message": None,
+            **insights,
+        })
+        
+        if speakers_info and user_id:
+            save_identified_speakers(user_id, analysis_id, speakers_info)
+        
+        print(f"[reprocess] Completed {analysis_id[:8]}")
+        return {"ok": True, "id": analysis_id}
+    except Exception as e:
+        fail_analysis(analysis_id, f"Reprocess error: {str(e)}")
+        return {"error": str(e)}
 
 def handle_export(data):
     """Generate a comprehensive export of the analysis."""
