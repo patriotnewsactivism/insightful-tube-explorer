@@ -1,9 +1,11 @@
 """
-TubeScribe: Audio Worker v6
+TubeScribe: Audio Worker v8
 Pipeline: Pasted transcript → Supadata API → YouTube captions fallback
          → Azure OpenAI insights (parallel)
 
-v6: Supadata API integration — bypasses YouTube bot detection entirely
+v6: Supadata API integration
+v7: Speaker ID, polished transcript, AI chat, export
+v8: Fact extraction, entity extraction, cross-video search, bulk support
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -752,6 +754,14 @@ def run_pipeline(record):
             for i in range(0, len(rows), 500):
                 sb_insert("speaker_utterances", rows[i:i+500])
 
+        # ── Extract facts & entities (async, after completion) ──
+        import threading as _th
+        _th.Thread(
+            target=extract_facts_and_entities,
+            args=(analysis_id, user_id, title, polished, description),
+            daemon=True,
+        ).start()
+
         total = time.time() - t_start
         print(f"[worker] ✅ Complete in {total:.1f}s ({used_source}) for {analysis_id}")
 
@@ -778,6 +788,255 @@ def save_identified_speakers(user_id, analysis_id, speakers_info):
             print(f"[worker] New speaker saved: {name}")
     except Exception as e:
         print(f"[worker] Speaker save error: {e}")
+
+# ── Fact Extraction ───────────────────────────────────────────────────────────
+def extract_facts_and_entities(analysis_id, user_id, title, transcript, description=""):
+    """Extract factual claims and entities from a completed analysis — runs after main pipeline."""
+    ctx = f'Video title: "{title}"\n' if title else ""
+    if description:
+        ctx += f'Description: "{description[:500]}"\n'
+    t = transcript[:14000]
+
+    prompts = [
+        # Facts extraction
+        (f'''Extract ALL factual claims from this transcript that would be useful for a book about American injustice.
+Return ONLY valid JSON (no markdown): {{"facts": [
+  {{"claim": "factual statement", "category": "legal|date|person|location|event|claim|quote", "confidence": "high|medium|low", "timestamp_hint": "approximate time context or null", "citation": "formatted citation"}}
+]}}
+
+Categories:
+- legal: court cases, filings, legal proceedings, rights violations, statutes
+- date: specific dates, time periods, deadlines mentioned
+- person: people identified with roles/actions
+- location: places, courts, jurisdictions, addresses
+- event: specific events, incidents, meetings
+- claim: allegations, assertions, accusations
+- quote: direct quotes from speakers
+
+For citations, format as: "[Speaker/Source], [Video Title], [approx timestamp if known]"
+
+Be thorough — extract every verifiable fact. A book researcher needs these.''',
+         f"{ctx}Transcript:\n{t}"),
+
+        # Entity extraction
+        (f'''Identify ALL people, organizations, courts, agencies, and places mentioned in this transcript.
+Return ONLY valid JSON (no markdown): {{"entities": [
+  {{"name": "full name", "type": "person|organization|court|agency|place|event", "aliases": ["alternate names"], "description": "brief description/role", "context_snippet": "short quote showing mention", "mention_count": 1}}
+]}}
+
+Be thorough — include every named entity, even if mentioned briefly. Include:
+- All people (full names when possible)
+- All organizations, agencies, departments
+- All courts, jurisdictions
+- All places, cities, counties, states
+- Significant events referenced''',
+         f"{ctx}Transcript:\n{t}"),
+    ]
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(call_openai, p[0], p[1], 4000) for p in prompts]
+            facts_raw, entities_raw = [f.result() for f in futures]
+
+        # Parse and save facts
+        facts = []
+        try:
+            m = re.search(r"\{[\s\S]*\}", facts_raw)
+            if m:
+                facts = json.loads(m.group()).get("facts", [])
+        except Exception as e:
+            print(f"[worker] Facts parse error: {e}")
+
+        if facts:
+            fact_rows = []
+            for f in facts:
+                ts_hint = f.get("timestamp_hint")
+                ts_seconds = None
+                if ts_hint and isinstance(ts_hint, str):
+                    # Try to parse "1:23" or "83s" style timestamps
+                    ts_m = re.match(r'(\d+):(\d+)', ts_hint)
+                    if ts_m:
+                        ts_seconds = int(ts_m.group(1)) * 60 + int(ts_m.group(2))
+
+                fact_rows.append({
+                    "user_id": user_id,
+                    "analysis_id": analysis_id,
+                    "claim": f.get("claim", "")[:2000],
+                    "category": f.get("category", "general"),
+                    "source_timestamp": ts_seconds,
+                    "citation": f.get("citation", ""),
+                    "confidence": f.get("confidence", "medium"),
+                })
+            for i in range(0, len(fact_rows), 50):
+                sb_insert("facts", fact_rows[i:i+50])
+            print(f"[worker] Saved {len(fact_rows)} facts for {analysis_id}")
+
+        # Parse and save entities
+        raw_entities = []
+        try:
+            m = re.search(r"\{[\s\S]*\}", entities_raw)
+            if m:
+                raw_entities = json.loads(m.group()).get("entities", [])
+        except Exception as e:
+            print(f"[worker] Entities parse error: {e}")
+
+        if raw_entities:
+            save_entities(user_id, analysis_id, raw_entities)
+
+    except Exception as e:
+        print(f"[worker] Fact/entity extraction error: {e}")
+
+
+def save_entities(user_id, analysis_id, raw_entities):
+    """Save entities, merging with existing ones."""
+    try:
+        existing = sb_get("entities", {"user_id": user_id}, "id,name,entity_type,aliases")
+        existing_map = {}
+        for e in existing:
+            existing_map[e["name"].lower()] = e
+            for alias in (e.get("aliases") or []):
+                existing_map[alias.lower()] = e
+
+        for ent in raw_entities:
+            name = ent.get("name", "").strip()
+            if not name or len(name) < 2:
+                continue
+            ent_type = ent.get("type", "person")
+            aliases = ent.get("aliases", [])
+
+            # Check if entity already exists
+            match = existing_map.get(name.lower())
+            if not match:
+                for alias in aliases:
+                    match = existing_map.get(alias.lower())
+                    if match:
+                        break
+
+            if match:
+                # Add mention to existing entity
+                sb_insert("entity_mentions", [{
+                    "entity_id": match["id"],
+                    "analysis_id": analysis_id,
+                    "context": (ent.get("context_snippet") or "")[:500],
+                    "role": (ent.get("description") or "")[:500],
+                    "mention_count": ent.get("mention_count", 1),
+                }])
+            else:
+                # Create new entity
+                url = f"{SUPABASE_URL}/rest/v1/entities?select=id"
+                headers = {**sb_headers(), "Prefer": "return=representation"}
+                row = {
+                    "user_id": user_id,
+                    "name": name,
+                    "entity_type": ent_type,
+                    "aliases": aliases,
+                    "description": (ent.get("description") or "")[:1000],
+                    "first_seen_analysis": analysis_id,
+                }
+                req = Request(url, data=json.dumps(row).encode(), headers=headers, method="POST")
+                try:
+                    resp = json.loads(urlopen(req).read())
+                    if resp and isinstance(resp, list) and resp[0].get("id"):
+                        entity_id = resp[0]["id"]
+                        existing_map[name.lower()] = {"id": entity_id, "name": name}
+                        # Add first mention
+                        sb_insert("entity_mentions", [{
+                            "entity_id": entity_id,
+                            "analysis_id": analysis_id,
+                            "context": (ent.get("context_snippet") or "")[:500],
+                            "role": (ent.get("description") or "")[:500],
+                            "mention_count": ent.get("mention_count", 1),
+                        }])
+                except HTTPError as e:
+                    print(f"[worker] Entity insert error: {e.status}: {e.read()}")
+
+        print(f"[worker] Processed {len(raw_entities)} entities for {analysis_id}")
+    except Exception as e:
+        print(f"[worker] Entity save error: {e}")
+
+
+# ── Cross-Video Search ────────────────────────────────────────────────────────
+def handle_search(data):
+    """Search across all analyses for a user."""
+    query = data.get("query", "").strip()
+    user_id = data.get("user_id")
+    if not query or not user_id:
+        return {"error": "query and user_id required"}
+
+    results = []
+    query_lower = query.lower()
+    terms = query_lower.split()
+
+    # Fetch all analyses for this user
+    url = f"{SUPABASE_URL}/rest/v1/analyses?user_id=eq.{user_id}&select=id,title,youtube_id,channel,summary,polished_transcript,expanded_notes,likely_production_date,raw_transcript&order=created_at.desc"
+    headers = {**sb_headers(), "Prefer": ""}
+    req = Request(url, headers=headers)
+    try:
+        analyses = json.loads(urlopen(req).read())
+    except Exception as e:
+        return {"error": f"DB error: {e}"}
+
+    for a in analyses:
+        # Search across multiple fields
+        fields = {
+            "summary": a.get("summary") or "",
+            "transcript": a.get("polished_transcript") or "",
+            "notes": a.get("expanded_notes") or "",
+            "date": f"{a.get('likely_production_date', '')} {(a.get('raw_transcript') or {}).get('production_date_reasoning', '')}",
+        }
+
+        for field_name, text in fields.items():
+            if not text:
+                continue
+            text_lower = text.lower()
+            # Check if all search terms appear
+            if all(term in text_lower for term in terms):
+                # Extract snippet around first match
+                idx = text_lower.find(terms[0])
+                start = max(0, idx - 80)
+                end = min(len(text), idx + len(terms[0]) + 150)
+                snippet = text[start:end].strip()
+                if start > 0:
+                    snippet = "…" + snippet
+                if end < len(text):
+                    snippet = snippet + "…"
+
+                results.append({
+                    "analysis_id": a["id"],
+                    "title": a.get("title"),
+                    "youtube_id": a.get("youtube_id"),
+                    "channel": a.get("channel"),
+                    "snippet": snippet,
+                    "field": field_name,
+                    "likely_production_date": a.get("likely_production_date"),
+                })
+                break  # One result per analysis
+
+    # Also search facts
+    fact_url = f"{SUPABASE_URL}/rest/v1/facts?user_id=eq.{user_id}&select=claim,category,analysis_id,citation"
+    req = Request(fact_url, headers={**sb_headers(), "Prefer": ""})
+    try:
+        facts = json.loads(urlopen(req).read())
+        for f in facts:
+            claim_lower = (f.get("claim") or "").lower()
+            if all(term in claim_lower for term in terms):
+                # Check if we already have this analysis in results
+                existing_ids = {r["analysis_id"] for r in results}
+                if f["analysis_id"] not in existing_ids:
+                    results.append({
+                        "analysis_id": f["analysis_id"],
+                        "title": None,  # Will be populated by frontend join
+                        "youtube_id": None,
+                        "channel": None,
+                        "snippet": f["claim"][:200],
+                        "field": f"fact ({f.get('category', 'general')})",
+                        "likely_production_date": None,
+                    })
+    except Exception:
+        pass
+
+    return {"results": results[:50]}
+
 
 # ── AI Chat endpoint ──────────────────────────────────────────────────────────
 def handle_chat(data):
@@ -880,7 +1139,7 @@ class Handler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps({
-            "status": "ok", "version": "v7", "supadata": supadata
+            "status": "ok", "version": "v8", "supadata": supadata
         }).encode())
 
     def do_POST(self):
@@ -899,6 +1158,16 @@ class Handler(BaseHTTPRequestHandler):
         # ── Chat endpoint ──
         if path == "/chat":
             result = handle_chat(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── Search endpoint ──
+        if path == "/search":
+            result = handle_search(payload)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._cors_headers()
@@ -1017,6 +1286,6 @@ def handle_export(data):
     return {"text": "\n".join(sections), "title": a.get("title", "export")}
 
 if __name__ == "__main__":
-    print(f"[worker] v7 — Supadata: {'enabled' if SUPADATA_API_KEY else 'not configured'}")
+    print(f"[worker] v8 — Supadata: {'enabled' if SUPADATA_API_KEY else 'not configured'}")
     print(f"[worker] Listening on port {PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
