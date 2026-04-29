@@ -28,6 +28,12 @@ AZURE_STORAGE_ACCOUNT    = "wtptranscriptionstorage"
 AZURE_STORAGE_CONTAINER  = "transcriptions"
 AZURE_OPENAI_KEY         = os.environ["AZURE_OPENAI_API_KEY"]
 AZURE_OPENAI_DEPLOYMENT  = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
+
+# ── Grok (primary model via Azure AI Foundry) ───────────────────────────────
+GROK_ENDPOINT = os.environ.get("GROK_ENDPOINT", "https://patri-mojrzk25-swedencentral.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview")
+GROK_API_KEY  = os.environ.get("GROK_API_KEY", "")
+GROK_MODEL    = os.environ.get("GROK_MODEL", "grok-4-1-fast-reasoning")
+USE_GROK      = bool(GROK_API_KEY)  # auto-enable if key is set
 SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
 
@@ -510,12 +516,37 @@ def parse_fast_utterances(result):
         utterances.append({"speaker": speaker, "text": text, "start": start, "end": start + duration})
     return utterances
 
-# ── Azure OpenAI ─────────────────────────────────────────────────────────────
+# ── AI Model Calls ───────────────────────────────────────────────────────────
 OPENAI_URL = "https://openaiyoutube.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
 
 CONTENT_FILTER_FALLBACK = "[Content filtered by Azure — this section could not be analyzed due to content policy restrictions on the transcript material.]"
 
-def call_openai(instructions, input_text, max_tokens=2000):
+
+def _call_grok(instructions, input_text, max_tokens=2000):
+    """Call Grok via Azure AI Foundry (standard chat/completions format)."""
+    messages = []
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+    if input_text:
+        messages.append({"role": "user", "content": input_text})
+    body = {
+        "model": GROK_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    req = Request(GROK_ENDPOINT, data=json.dumps(body).encode(), headers={
+        "Authorization": f"Bearer {GROK_API_KEY}",
+        "Content-Type": "application/json",
+    }, method="POST")
+    data = json.loads(urlopen(req, timeout=120).read())
+    choices = data.get("choices", [])
+    if choices:
+        return choices[0].get("message", {}).get("content", "")
+    return ""
+
+
+def _call_azure_openai(instructions, input_text, max_tokens=2000):
+    """Call Azure OpenAI Responses API (fallback)."""
     body = {
         "model": AZURE_OPENAI_DEPLOYMENT, "instructions": instructions,
         "input": input_text, "max_output_tokens": max_tokens,
@@ -523,22 +554,36 @@ def call_openai(instructions, input_text, max_tokens=2000):
     req = Request(OPENAI_URL, data=json.dumps(body).encode(), headers={
         "api-key": AZURE_OPENAI_KEY, "Content-Type": "application/json",
     }, method="POST")
-    try:
-        data = json.loads(urlopen(req).read())
-    except HTTPError as e:
-        body_bytes = e.read()
-        body_str = body_bytes.decode("utf-8", errors="replace") if isinstance(body_bytes, bytes) else str(body_bytes)
-        # If Azure content filter triggered, return fallback instead of crashing pipeline
-        if e.status == 400 and "content_filter" in body_str:
-            print(f"[call_openai] Content filter triggered, returning fallback. Details: {body_str[:300]}")
-            return CONTENT_FILTER_FALLBACK
-        raise RuntimeError(f"Azure OpenAI failed ({e.status}): {body_str}")
+    data = json.loads(urlopen(req).read())
     for item in data.get("output", []):
         if item.get("type") == "message":
             for block in item.get("content", []):
                 if block.get("type") == "output_text":
                     return block["text"]
     return data.get("output_text", "")
+
+
+def call_openai(instructions, input_text, max_tokens=2000):
+    """Route to Grok (primary) with Azure OpenAI fallback."""
+    if USE_GROK:
+        try:
+            result = _call_grok(instructions, input_text, max_tokens)
+            if result:
+                return result
+            print("[call_openai] Grok returned empty, falling back to Azure OpenAI")
+        except Exception as e:
+            err_str = str(e)
+            print(f"[call_openai] Grok failed: {err_str[:300]}, falling back to Azure OpenAI")
+    # Fallback to Azure OpenAI
+    try:
+        return _call_azure_openai(instructions, input_text, max_tokens)
+    except HTTPError as e:
+        body_bytes = e.read()
+        body_str = body_bytes.decode("utf-8", errors="replace") if isinstance(body_bytes, bytes) else str(body_bytes)
+        if e.status == 400 and "content_filter" in body_str:
+            print(f"[call_openai] Content filter triggered, returning fallback. Details: {body_str[:300]}")
+            return CONTENT_FILTER_FALLBACK
+        raise RuntimeError(f"Azure OpenAI failed ({e.status}): {body_str}")
 
 def get_known_speakers(user_id):
     """Fetch known speakers for this user to help with identification."""
