@@ -26,7 +26,7 @@ AZURE_SPEECH_KEY         = os.environ.get("AZURE_SPEECH_API_KEY", "")
 AZURE_STORAGE_CONN       = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
 AZURE_STORAGE_ACCOUNT    = "wtptranscriptionstorage"
 AZURE_STORAGE_CONTAINER  = "transcriptions"
-AZURE_OPENAI_KEY         = os.environ["AZURE_OPENAI_API_KEY"]
+AZURE_OPENAI_KEY         = os.environ.get("AZURE_OPENAI_API_KEY", "")
 AZURE_OPENAI_DEPLOYMENT  = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
 
 # ── Grok (primary model via Azure AI Foundry) ───────────────────────────────
@@ -34,6 +34,12 @@ GROK_ENDPOINT = os.environ.get("GROK_ENDPOINT", "https://patri-mojrzk25-swedence
 GROK_API_KEY  = os.environ.get("GROK_API_KEY", "")
 GROK_MODEL    = os.environ.get("GROK_MODEL", "grok-4-1-fast-reasoning")
 USE_GROK      = bool(GROK_API_KEY)  # auto-enable if key is set
+
+# ── DeepSeek V3.2 (fallback model via Azure AI Foundry) ─────────────────────
+DEEPSEEK_ENDPOINT = os.environ.get("DEEPSEEK_ENDPOINT", "https://patri-moar8a1w-eastus2.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview")
+DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL    = os.environ.get("DEEPSEEK_MODEL", "DeepSeek-V3-2")
+USE_DEEPSEEK      = bool(DEEPSEEK_API_KEY)  # auto-enable if key is set
 SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
 
@@ -545,8 +551,29 @@ def _call_grok(instructions, input_text, max_tokens=2000):
     return ""
 
 
+def _call_deepseek(instructions, input_text, max_tokens=2000):
+    """Call DeepSeek V3.2 via Azure AI Foundry Chat Completions API (fallback)."""
+    body = {
+        "messages": [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": input_text},
+        ],
+        "max_tokens": max_tokens,
+        "model": DEEPSEEK_MODEL,
+    }
+    req = Request(DEEPSEEK_ENDPOINT, data=json.dumps(body).encode(), headers={
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }, method="POST")
+    data = json.loads(urlopen(req, timeout=120).read())
+    choices = data.get("choices", [])
+    if choices:
+        return choices[0].get("message", {}).get("content", "")
+    return ""
+
+
 def _call_azure_openai(instructions, input_text, max_tokens=2000):
-    """Call Azure OpenAI Responses API (fallback)."""
+    """Call Azure OpenAI Responses API (legacy fallback)."""
     body = {
         "model": AZURE_OPENAI_DEPLOYMENT, "instructions": instructions,
         "input": input_text, "max_output_tokens": max_tokens,
@@ -564,17 +591,27 @@ def _call_azure_openai(instructions, input_text, max_tokens=2000):
 
 
 def call_openai(instructions, input_text, max_tokens=2000):
-    """Route to Grok (primary) with Azure OpenAI fallback."""
+    """Route to Grok (primary) → DeepSeek V3.2 (fallback) → Azure OpenAI (last resort)."""
     if USE_GROK:
         try:
             result = _call_grok(instructions, input_text, max_tokens)
             if result:
                 return result
-            print("[call_openai] Grok returned empty, falling back to Azure OpenAI")
+            print("[call_openai] Grok returned empty, falling back to DeepSeek V3.2")
         except Exception as e:
             err_str = str(e)
-            print(f"[call_openai] Grok failed: {err_str[:300]}, falling back to Azure OpenAI")
-    # Fallback to Azure OpenAI
+            print(f"[call_openai] Grok failed: {err_str[:300]}, falling back to DeepSeek V3.2")
+    # Fallback 1: DeepSeek V3.2
+    if USE_DEEPSEEK:
+        try:
+            result = _call_deepseek(instructions, input_text, max_tokens)
+            if result:
+                return result
+            print("[call_openai] DeepSeek returned empty, falling back to Azure OpenAI")
+        except Exception as e:
+            err_str = str(e)
+            print(f"[call_openai] DeepSeek failed: {err_str[:300]}, falling back to Azure OpenAI")
+    # Fallback 2: Azure OpenAI (last resort)
     try:
         return _call_azure_openai(instructions, input_text, max_tokens)
     except HTTPError as e:
