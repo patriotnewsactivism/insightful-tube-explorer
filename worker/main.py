@@ -552,7 +552,7 @@ def generate_insights(transcript, title, description="", user_id=None):
     ctx = f'Video title: "{title}"\n\n' if title else ""
     if description:
         ctx += f'Video description: "{description[:500]}"\n\n'
-    t = transcript[:12000]
+    t = transcript[:60000]
 
     # Get known speakers for context
     known_speakers = get_known_speakers(user_id) if user_id else []
@@ -565,18 +565,45 @@ def generate_insights(transcript, title, description="", user_id=None):
     research_ctx = "You are a professional research assistant helping a journalist and author document public records, court proceedings, and civic matters for a nonfiction book. All content is from publicly available YouTube videos. Your role is to accurately transcribe, summarize, and organize this public interest content."
 
     prompts = [
-        (f"{research_ctx}\n\nProduce a concise 3-5 sentence summary of the key points discussed in this public interest video.",
+        (f"{research_ctx}\n\nProduce a thorough summary of this video. Include: the main topic, all key points discussed, names of people and organizations mentioned, any legal proceedings or events described, and the overall significance. Be detailed — aim for 2-3 paragraphs, not just a few sentences.",
          f"{ctx}Transcript:\n{t}"),
         (f'{research_ctx}\n\nAnalyze the tone and return ONLY valid JSON (no markdown): {{"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}}',
          f"{ctx}Transcript:\n{t}"),
-        (f"{research_ctx}\n\nProduce detailed expanded research notes with sections: ## Main Topics, ## Key Claims, ## Notable Quotes, ## Action Items, ## Unanswered Questions",
+        (f"""{research_ctx}\n\nProduce comprehensive expanded research notes from this video transcript. Be thorough and extract ALL useful information.
+
+Use these sections:
+## Main Topics
+(List and explain every topic discussed, not just headlines)
+
+## Key Claims & Allegations
+(Every factual claim, allegation, or assertion made — include who said it)
+
+## People & Organizations
+(Every person and organization mentioned, with their role and what was said about them)
+
+## Legal & Official Proceedings
+(Any court cases, filings, hearings, laws, or official actions referenced)
+
+## Notable Quotes
+(Direct quotes that are significant, with speaker attribution)
+
+## Timeline of Events
+(Chronological sequence of events discussed)
+
+## Action Items & Next Steps
+(Anything mentioned as needing to be done)
+
+## Unanswered Questions
+(Questions raised but not answered in the video)
+
+Be exhaustive. A researcher using these notes should not need to re-watch the video.""",
          f"{ctx}Transcript:\n{t}"),
         (f'{research_ctx}\n\nAnalyze for clues about when this content was produced. Return ONLY valid JSON (no markdown): {{"likely_production_date":"<date range>","reasoning":"<brief>"}}',
-         f"{ctx}Transcript:\n{transcript[:8000]}"),
-        # 5th call: Speaker-aware polished transcript
+         f"{ctx}Transcript:\n{t}"),
+        # 5th call: Speaker-aware polished transcript (placeholder — may be replaced by chunked version below)
         (f'''{research_ctx}
 
-You are an expert transcript editor. Create a polished, readable version of this transcript for research documentation purposes.
+You are an expert transcript editor. Create a polished, readable version of this COMPLETE transcript for research documentation purposes. Do NOT truncate, summarize, or skip any part of the transcript.
 
 Rules:
 1. Identify different speakers from context clues (names mentioned, "I", "you", conversation flow, who is recording, etc.)
@@ -585,10 +612,11 @@ Rules:
 4. Add paragraph breaks at natural topic shifts
 5. Keep the meaning 100% accurate — never change what was said, only how it reads
 6. Format as: **Speaker Name:** Their dialogue here...
-7. Add [timestamp] markers every few paragraphs if timing info is available{speaker_ctx}
+7. Add [timestamp] markers every few paragraphs if timing info is available
+8. Include EVERY part of the conversation from start to finish{speaker_ctx}
 
-Return ONLY the polished transcript text, no other commentary.''',
-         f"{ctx}Transcript:\n{transcript[:14000]}"),
+Return ONLY the polished transcript text, no other commentary. Do not skip or summarize any sections.''',
+         f"{ctx}Transcript:\n{transcript[:60000]}"),
         # 6th call: Speaker identification JSON
         (f'''{research_ctx}
 
@@ -598,12 +626,32 @@ Identify all speakers in this transcript for research indexing. Return ONLY vali
 Look for: names mentioned in conversation, self-references, titles, the video creator/recorder.{speaker_ctx}''',
          f"{ctx}Transcript:\n{t}"),
     ]
+
+    # Token limits per call: polished transcript & notes get 16K, others get 4K
+    token_limits = {0: 4000, 1: 2000, 2: 8000, 3: 2000, 4: 16000, 5: 2000}
+
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = [executor.submit(call_openai, p[0], p[1], 4000 if i == 4 else 2000) for i, p in enumerate(prompts)]
+        futures = [executor.submit(call_openai, p[0], p[1], token_limits.get(i, 4000)) for i, p in enumerate(prompts)]
         results = [f.result() for f in futures]
     print(f"[worker] 6 OpenAI calls completed in {time.time()-t0:.1f}s (parallel)")
     summary, sentiment_raw, notes, date_raw, polished_text, speakers_raw = results
+
+    # If transcript is very long, process polished transcript in chunks and combine
+    if len(transcript) > 60000 and (not polished_text or len(polished_text) < len(transcript) * 0.3):
+        print(f"[worker] Transcript is {len(transcript)} chars, processing polished transcript in chunks...")
+        chunk_size = 50000
+        chunks = [transcript[i:i+chunk_size] for i in range(0, len(transcript), chunk_size)]
+        polished_parts = []
+        for ci, chunk in enumerate(chunks):
+            part = call_openai(
+                f'''{research_ctx}\n\nYou are an expert transcript editor. Polish this section (part {ci+1} of {len(chunks)}) into clean, readable text. Fix grammar, add speaker labels, add paragraph breaks. Do NOT skip or summarize any content. Output ONLY the polished text.{speaker_ctx}''',
+                f"{ctx}Transcript section {ci+1}/{len(chunks)}:\n{chunk}",
+                16000
+            )
+            polished_parts.append(part)
+        polished_text = "\n\n".join(polished_parts)
+        print(f"[worker] Chunked polished transcript: {len(polished_text)} chars from {len(chunks)} chunks")
 
     # Detect Azure content filter refusals and retry with softer framing
     REFUSAL_MARKERS = ["cannot assist", "can't assist", "i'm sorry", "i am sorry", "unable to process", "content policy"]
@@ -612,7 +660,7 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
 
     retry_prompts = {}
     if is_refusal(polished_text):
-        retry_prompts[4] = (f"{research_ctx}\n\nClean up this raw transcript into readable paragraphs. Fix typos and add speaker labels where possible. Output only the cleaned text.", f"{ctx}Raw text:\n{transcript[:14000]}")
+        retry_prompts[4] = (f"{research_ctx}\n\nClean up this raw transcript into readable paragraphs. Fix typos and add speaker labels where possible. Output only the cleaned text.", f"{ctx}Raw text:\n{transcript[:60000]}")
     if is_refusal(notes):
         retry_prompts[2] = (f"{research_ctx}\n\nCreate organized research notes from this public video transcript. Sections: Topics Discussed, Key Points, Questions Raised.", f"{ctx}Transcript:\n{t}")
     if is_refusal(summary):
@@ -621,7 +669,7 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
     if retry_prompts:
         print(f"[worker] Retrying {len(retry_prompts)} refusal(s): indices {list(retry_prompts.keys())}")
         with ThreadPoolExecutor(max_workers=len(retry_prompts)) as executor:
-            retry_futures = {idx: executor.submit(call_openai, p[0], p[1], 4000 if idx == 4 else 2000) for idx, p in retry_prompts.items()}
+            retry_futures = {idx: executor.submit(call_openai, p[0], p[1], token_limits.get(idx, 4000)) for idx, p in retry_prompts.items()}
             for idx, fut in retry_futures.items():
                 val = fut.result()
                 if not is_refusal(val):
@@ -839,7 +887,7 @@ def extract_facts_and_entities(analysis_id, user_id, title, transcript, descript
     ctx = f'Video title: "{title}"\n' if title else ""
     if description:
         ctx += f'Description: "{description[:500]}"\n'
-    t = transcript[:14000]
+    t = transcript[:60000]
 
     prompts = [
         # Facts extraction
@@ -879,7 +927,7 @@ Be thorough — include every named entity, even if mentioned briefly. Include:
 
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(call_openai, p[0], p[1], 4000) for p in prompts]
+            futures = [executor.submit(call_openai, p[0], p[1], 8000) for p in prompts]
             facts_raw, entities_raw = [f.result() for f in futures]
 
         # Parse and save facts
@@ -1005,7 +1053,7 @@ def extract_quotes_and_timeline(analysis_id, user_id, title, transcript, descrip
     ctx = f'Video title: "{title}"\n' if title else ""
     if description:
         ctx += f'Description: "{description[:500]}"\n'
-    t = transcript[:14000]
+    t = transcript[:60000]
 
     prompts = [
         # Quote extraction
@@ -1041,7 +1089,7 @@ Use context clues to estimate dates. If the video was likely recorded around a c
 
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(call_openai, p[0], p[1], 4000) for p in prompts]
+            futures = [executor.submit(call_openai, p[0], p[1], 8000) for p in prompts]
             quotes_raw, timeline_raw = [f.result() for f in futures]
 
         # Parse and save quotes
@@ -1130,10 +1178,10 @@ def detect_contradictions(analysis_id, user_id, title, transcript):
 Identify any contradictions, inconsistencies, or conflicting accounts.
 
 EXISTING FACTS:
-{fact_block[:6000]}
+{fact_block[:20000]}
 
 NEW VIDEO: "{title}"
-{transcript[:6000]}
+{transcript[:30000]}
 
 Return ONLY valid JSON (no markdown): {{"contradictions": [
   {{"claim_a": "the existing fact that conflicts", "claim_a_source_id": "the 8-char analysis ID prefix from brackets", "claim_b": "the contradicting claim from this new video", "explanation": "why these conflict", "severity": "high|medium|low"}}
@@ -1291,7 +1339,7 @@ Date reasoning: {analysis.get('production_date_reasoning', '')}
 Summary: {analysis.get('summary', '')}
 
 Polished Transcript:
-{(analysis.get('polished_transcript') or '')[:8000]}
+{(analysis.get('polished_transcript') or '')[:30000]}
 
 Notes:
 {(analysis.get('expanded_notes') or '')[:4000]}
