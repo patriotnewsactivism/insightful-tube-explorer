@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import {
   Loader2, ArrowLeft, AlertCircle, Clock, Users, FileText,
   Sparkles, Calendar, Download, MessageSquare, Send, User,
-  ChevronDown, ChevronUp, Copy, Check
+  ChevronDown, ChevronUp, Copy, Check, Mic, MicOff, RefreshCw
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -210,13 +210,125 @@ function SpeakerInfoCard({ speakersInfo }: { speakersInfo: any[] }) {
   );
 }
 
+// ── Notes Tab with Reprocess & Length Control ─────────────────────────────────
+function NotesTab({ analysis, onUpdate }: { analysis: Analysis; onUpdate: () => void }) {
+  const [noteLength, setNoteLength] = useState<"short" | "medium" | "detailed">("medium");
+  const [reprocessing, setReprocessing] = useState(false);
+
+  async function handleReprocess() {
+    setReprocessing(true);
+    try {
+      const res = await fetch(`${WORKER_URL}/reprocess-insights`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          analysis_id: analysis.id,
+          note_length: noteLength,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        toast.error(data.error);
+        setReprocessing(false);
+      } else {
+        toast.success("Reprocessing started — this may take a minute");
+        // Poll for completion
+        const poll = setInterval(async () => {
+          onUpdate();
+        }, 3000);
+        setTimeout(() => {
+          clearInterval(poll);
+          setReprocessing(false);
+          onUpdate();
+        }, 90000);
+        // Also listen for status change via existing realtime subscription
+        setTimeout(() => {
+          setReprocessing(false);
+          onUpdate();
+        }, 5000);
+      }
+    } catch (err: any) {
+      toast.error(err.message);
+      setReprocessing(false);
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-border bg-surface/40 p-6">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="font-display text-lg font-semibold">Expanded Notes</h2>
+        <div className="flex items-center gap-2">
+          <select
+            value={noteLength}
+            onChange={(e) => setNoteLength(e.target.value as any)}
+            className="text-xs bg-muted border border-border rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-primary/40"
+            disabled={reprocessing}
+          >
+            <option value="short">Short</option>
+            <option value="medium">Medium</option>
+            <option value="detailed">Detailed</option>
+          </select>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleReprocess}
+            disabled={reprocessing}
+            className="gap-1.5"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${reprocessing ? "animate-spin" : ""}`} />
+            {reprocessing ? "Reprocessing…" : "Reprocess"}
+          </Button>
+        </div>
+      </div>
+      <div className="text-sm leading-relaxed whitespace-pre-wrap prose prose-sm max-w-none">
+        {analysis.expanded_notes ?? "No notes available."}
+      </div>
+    </div>
+  );
+}
+
 // ── AI Chat Panel ────────────────────────────────────────────────────────────
 function AIChatPanel({ analysisId, onUpdate }: { analysisId: string; onUpdate: () => void }) {
   const { user } = useAuth();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef<any>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Web Speech API voice input
+  const toggleVoice = useCallback(() => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      toast.error("Speech recognition not supported in this browser");
+      return;
+    }
+
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = "en-US";
+
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      setInput((prev) => (prev ? prev + " " + transcript : transcript));
+      setIsListening(false);
+    };
+
+    recognition.onerror = () => setIsListening(false);
+    recognition.onend = () => setIsListening(false);
+
+    recognitionRef.current = recognition;
+    recognition.start();
+    setIsListening(true);
+  }, [isListening]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -253,7 +365,8 @@ function AIChatPanel({ analysisId, onUpdate }: { analysisId: string; onUpdate: (
           updates: data.updates_applied,
         }]);
         if (data.updates_applied && Object.keys(data.updates_applied).length > 0) {
-          onUpdate();
+          // Small delay to let DB write settle before re-fetching
+          setTimeout(() => onUpdate(), 800);
           toast.success("Analysis updated!");
         }
       }
@@ -325,6 +438,15 @@ function AIChatPanel({ analysisId, onUpdate }: { analysisId: string; onUpdate: (
           className="flex-1 bg-muted rounded-lg px-4 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
           disabled={sending}
         />
+        <Button
+          type="button"
+          size="sm"
+          variant={isListening ? "destructive" : "outline"}
+          onClick={toggleVoice}
+          title={isListening ? "Stop listening" : "Voice input"}
+        >
+          {isListening ? <MicOff className="h-4 w-4 animate-pulse" /> : <Mic className="h-4 w-4" />}
+        </Button>
         <Button type="submit" size="sm" disabled={!input.trim() || sending}>
           <Send className="h-4 w-4" />
         </Button>
@@ -627,12 +749,7 @@ function AnalysisPage() {
             )}
 
             {activeTab === "notes" && (
-              <div className="rounded-xl border border-border bg-surface/40 p-6">
-                <h2 className="font-display text-lg font-semibold mb-3">Expanded Notes</h2>
-                <div className="text-sm leading-relaxed whitespace-pre-wrap prose prose-sm max-w-none">
-                  {a.expanded_notes ?? "No notes available."}
-                </div>
-              </div>
+              <NotesTab analysis={a} onUpdate={fetchAnalysis} />
             )}
 
             {activeTab === "sentiment" && (

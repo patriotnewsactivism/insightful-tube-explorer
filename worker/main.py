@@ -630,28 +630,55 @@ def get_known_speakers(user_id):
     except Exception:
         return []
 
-def generate_insights(transcript, title, description="", user_id=None):
-    ctx = f'Video title: "{title}"\n\n' if title else ""
-    if description:
-        ctx += f'Video description: "{description[:500]}"\n\n'
-    t = transcript[:60000]
+def _get_notes_prompt(research_ctx, note_length="medium"):
+    """Return notes prompt based on desired length: short, medium, or detailed."""
+    if note_length == "short":
+        return f"""{research_ctx}\n\nProduce concise research notes (~1 page) from this video transcript.
 
-    # Get known speakers for context
-    known_speakers = get_known_speakers(user_id) if user_id else []
-    speaker_ctx = ""
-    if known_speakers:
-        names = ", ".join(s["name"] for s in known_speakers[:20])
-        speaker_ctx = f"\n\nKnown speakers from previous videos: {names}. Try to match voices/speakers to these known people if they appear in this video."
+Use these sections:
+## Key Topics (bullet points)
+## Top 3 Claims (who said what)
+## People Mentioned (name and role)
+## Notable Quotes (2-3 most significant)
 
-    # System preamble for all prompts — helps avoid Azure content filter refusals
-    research_ctx = "You are a professional research assistant helping a journalist and author document public records, court proceedings, and civic matters for a nonfiction book. All content is from publicly available YouTube videos. Your role is to accurately transcribe, summarize, and organize this public interest content."
+Keep it brief and scannable."""
+    elif note_length == "detailed":
+        return f"""{research_ctx}\n\nProduce exhaustive, comprehensive expanded research notes from this video transcript. Extract EVERY piece of useful information. Leave nothing out.
 
-    prompts = [
-        (f"{research_ctx}\n\nProduce a thorough summary of this video. Include: the main topic, all key points discussed, names of people and organizations mentioned, any legal proceedings or events described, and the overall significance. Be detailed — aim for 2-3 paragraphs, not just a few sentences.",
-         f"{ctx}Transcript:\n{t}"),
-        (f'{research_ctx}\n\nAnalyze the tone and return ONLY valid JSON (no markdown): {{"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}}',
-         f"{ctx}Transcript:\n{t}"),
-        (f"""{research_ctx}\n\nProduce comprehensive expanded research notes from this video transcript. Be thorough and extract ALL useful information.
+Use these sections:
+## Main Topics
+(List and explain every topic discussed in depth, not just headlines)
+
+## Key Claims & Allegations
+(Every factual claim, allegation, or assertion made — include who said it, when, and any supporting evidence mentioned)
+
+## People & Organizations
+(Every person and organization mentioned, with their role, what was said about them, and relationships to other mentioned parties)
+
+## Legal & Official Proceedings
+(Any court cases, filings, hearings, laws, statutes, or official actions referenced — include case numbers if mentioned)
+
+## Notable Quotes
+(All significant direct quotes with full speaker attribution and context)
+
+## Timeline of Events
+(Detailed chronological sequence of all events discussed)
+
+## Data & Statistics
+(Any numbers, percentages, dates, or quantitative claims)
+
+## Action Items & Next Steps
+(Everything mentioned as needing to be done, by whom, and any deadlines)
+
+## Unanswered Questions
+(All questions raised but not answered in the video)
+
+## Cross-References
+(Connections to other events, people, or cases mentioned)
+
+Be maximally exhaustive. A researcher using these notes should NEVER need to re-watch the video."""
+    else:  # medium (default)
+        return f"""{research_ctx}\n\nProduce comprehensive expanded research notes from this video transcript. Be thorough and extract ALL useful information.
 
 Use these sections:
 ## Main Topics
@@ -678,7 +705,31 @@ Use these sections:
 ## Unanswered Questions
 (Questions raised but not answered in the video)
 
-Be exhaustive. A researcher using these notes should not need to re-watch the video.""",
+Be exhaustive. A researcher using these notes should not need to re-watch the video."""
+
+
+def generate_insights(transcript, title, description="", user_id=None, note_length="medium"):
+    ctx = f'Video title: "{title}"\n\n' if title else ""
+    if description:
+        ctx += f'Video description: "{description[:500]}"\n\n'
+    t = transcript[:60000]
+
+    # Get known speakers for context
+    known_speakers = get_known_speakers(user_id) if user_id else []
+    speaker_ctx = ""
+    if known_speakers:
+        names = ", ".join(s["name"] for s in known_speakers[:20])
+        speaker_ctx = f"\n\nKnown speakers from previous videos: {names}. Try to match voices/speakers to these known people if they appear in this video."
+
+    # System preamble for all prompts — helps avoid Azure content filter refusals
+    research_ctx = "You are a professional research assistant helping a journalist and author document public records, court proceedings, and civic matters for a nonfiction book. All content is from publicly available YouTube videos. Your role is to accurately transcribe, summarize, and organize this public interest content."
+
+    prompts = [
+        (f"{research_ctx}\n\nProduce a thorough summary of this video. Include: the main topic, all key points discussed, names of people and organizations mentioned, any legal proceedings or events described, and the overall significance. Be detailed — aim for 2-3 paragraphs, not just a few sentences.",
+         f"{ctx}Transcript:\n{t}"),
+        (f'{research_ctx}\n\nAnalyze the tone and return ONLY valid JSON (no markdown): {{"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}}',
+         f"{ctx}Transcript:\n{t}"),
+        (_get_notes_prompt(research_ctx, note_length),
          f"{ctx}Transcript:\n{t}"),
         (f'{research_ctx}\n\nAnalyze for clues about when this content was produced. Return ONLY valid JSON (no markdown): {{"likely_production_date":"<date range>","reasoning":"<brief>"}}',
          f"{ctx}Transcript:\n{t}"),
@@ -710,7 +761,8 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
     ]
 
     # Token limits per call: polished transcript & notes get 16K, others get 4K
-    token_limits = {0: 4000, 1: 2000, 2: 8000, 3: 2000, 4: 16000, 5: 2000}
+    notes_tokens = {"short": 2000, "medium": 8000, "detailed": 16000}.get(note_length, 8000)
+    token_limits = {0: 4000, 1: 2000, 2: notes_tokens, 3: 2000, 4: 16000, 5: 2000}
 
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -1579,6 +1631,7 @@ class Handler(BaseHTTPRequestHandler):
 def handle_reprocess_insights(data):
     """Re-run AI insights on an existing analysis using stored transcript data."""
     analysis_id = data.get("analysis_id")
+    note_length = data.get("note_length", "medium")
     if not analysis_id:
         return {"error": "analysis_id required"}
     
@@ -1603,11 +1656,11 @@ def handle_reprocess_insights(data):
     if not transcript or len(transcript) < 50:
         return {"error": f"no transcript data found ({len(transcript)} chars)"}
     
-    print(f"[reprocess] Starting insights for {analysis_id[:8]} ({len(transcript)} chars)")
+    print(f"[reprocess] Starting insights for {analysis_id[:8]} ({len(transcript)} chars) note_length={note_length}")
     set_status(analysis_id, "processing")
     
     try:
-        insights = generate_insights(transcript, title, user_id=user_id)
+        insights = generate_insights(transcript, title, user_id=user_id, note_length=note_length)
         speakers_info = insights.pop("speakers_info", [])
         
         sb_patch("analyses", {"id": analysis_id}, {
