@@ -210,6 +210,38 @@ function SpeakerInfoCard({ speakersInfo }: { speakersInfo: any[] }) {
   );
 }
 
+// ── AI Model Info Badge ───────────────────────────────────────────────────────
+function ModelInfoBadge({ analysis }: { analysis: Analysis }) {
+  const modelInfo = analysis.raw_transcript?.ai_model_info;
+  if (!modelInfo) return null;
+
+  return (
+    <div className="flex items-center gap-2 flex-wrap text-xs text-muted-foreground">
+      <Badge variant="outline" className="gap-1 text-[10px]">
+        <Sparkles className="h-3 w-3" />
+        {modelInfo.primary_model || "AI"}
+      </Badge>
+      {modelInfo.processing_time_seconds && (
+        <Badge variant="outline" className="gap-1 text-[10px]">
+          <Clock className="h-3 w-3" />
+          {modelInfo.processing_time_seconds}s
+        </Badge>
+      )}
+      {modelInfo.note_length && (
+        <Badge variant="outline" className="gap-1 text-[10px]">
+          <FileText className="h-3 w-3" />
+          {modelInfo.note_length} notes
+        </Badge>
+      )}
+      {modelInfo.models_used && modelInfo.models_used.length > 1 && (
+        <span className="text-[10px] opacity-60">
+          Also used: {modelInfo.models_used.filter((m: string) => m !== modelInfo.primary_model).join(", ")}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ── Notes Tab with Reprocess & Length Control ─────────────────────────────────
 function NotesTab({ analysis, onUpdate }: { analysis: Analysis; onUpdate: () => void }) {
   const [noteLength, setNoteLength] = useState<"short" | "medium" | "detailed">("medium");
@@ -686,6 +718,7 @@ function AnalysisPage() {
 
         {a.status === "complete" && (
           <>
+            <ModelInfoBadge analysis={a} />
             <SpeakerInfoCard speakersInfo={speakersInfo} />
 
             <div className="flex gap-1 border-b border-border mb-6 overflow-x-auto">

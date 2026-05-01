@@ -590,12 +590,15 @@ def _call_azure_openai(instructions, input_text, max_tokens=2000):
     return data.get("output_text", "")
 
 
-def call_openai(instructions, input_text, max_tokens=2000):
-    """Route to Grok (primary) → DeepSeek V3.2 (fallback) → Azure OpenAI (last resort)."""
+def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
+    """Route to Grok (primary) → DeepSeek V3.2 (fallback) → Azure OpenAI (last resort).
+    If _track_model is a list, appends the name of the model that succeeded."""
     if USE_GROK:
         try:
             result = _call_grok(instructions, input_text, max_tokens)
             if result:
+                if isinstance(_track_model, list):
+                    _track_model.append("Grok 4.1 Fast")
                 return result
             print("[call_openai] Grok returned empty, falling back to DeepSeek V3.2")
         except Exception as e:
@@ -606,6 +609,8 @@ def call_openai(instructions, input_text, max_tokens=2000):
         try:
             result = _call_deepseek(instructions, input_text, max_tokens)
             if result:
+                if isinstance(_track_model, list):
+                    _track_model.append("DeepSeek V3.2")
                 return result
             print("[call_openai] DeepSeek returned empty, falling back to Azure OpenAI")
         except Exception as e:
@@ -613,12 +618,17 @@ def call_openai(instructions, input_text, max_tokens=2000):
             print(f"[call_openai] DeepSeek failed: {err_str[:300]}, falling back to Azure OpenAI")
     # Fallback 2: Azure OpenAI (last resort)
     try:
-        return _call_azure_openai(instructions, input_text, max_tokens)
+        result = _call_azure_openai(instructions, input_text, max_tokens)
+        if isinstance(_track_model, list):
+            _track_model.append("GPT-5 Mini (Azure)")
+        return result
     except HTTPError as e:
         body_bytes = e.read()
         body_str = body_bytes.decode("utf-8", errors="replace") if isinstance(body_bytes, bytes) else str(body_bytes)
         if e.status == 400 and "content_filter" in body_str:
             print(f"[call_openai] Content filter triggered, returning fallback. Details: {body_str[:300]}")
+            if isinstance(_track_model, list):
+                _track_model.append("content_filter_fallback")
             return CONTENT_FILTER_FALLBACK
         raise RuntimeError(f"Azure OpenAI failed ({e.status}): {body_str}")
 
@@ -765,10 +775,15 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
     token_limits = {0: 4000, 1: 2000, 2: notes_tokens, 3: 2000, 4: 16000, 5: 2000}
 
     t0 = time.time()
+    # Track which model handled each call
+    model_trackers = [[] for _ in prompts]
     with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = [executor.submit(call_openai, p[0], p[1], token_limits.get(i, 4000)) for i, p in enumerate(prompts)]
+        futures = [executor.submit(call_openai, p[0], p[1], token_limits.get(i, 4000), model_trackers[i]) for i, p in enumerate(prompts)]
         results = [f.result() for f in futures]
-    print(f"[worker] 6 OpenAI calls completed in {time.time()-t0:.1f}s (parallel)")
+    elapsed = time.time() - t0
+    models_used = [t[0] if t else "unknown" for t in model_trackers]
+    primary_model = max(set(models_used), key=models_used.count) if models_used else "unknown"
+    print(f"[worker] 6 OpenAI calls completed in {elapsed:.1f}s (parallel) — models: {models_used}")
     summary, sentiment_raw, notes, date_raw, polished_text, speakers_raw = results
 
     # If transcript is very long, process polished transcript in chunks and combine
@@ -844,6 +859,12 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
         "likely_production_date": likely_date, "production_date_reasoning": date_reasoning,
         "polished_transcript": polished_text,
         "speakers_info": speakers_info,
+        "ai_model_info": {
+            "primary_model": primary_model,
+            "models_used": list(set(models_used)),
+            "processing_time_seconds": round(elapsed, 1),
+            "note_length": note_length,
+        },
     }
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
@@ -954,13 +975,14 @@ def run_pipeline(record):
         set_status(analysis_id, "processing")
         insights = generate_insights(polished, title, description, user_id=user_id)
 
-        # Extract speakers_info before saving (not a DB column)
+        # Extract non-column fields before saving
         speakers_info = insights.pop("speakers_info", [])
+        ai_model_info = insights.pop("ai_model_info", {})
 
         # ── Save ──
         sb_patch("analyses", {"id": analysis_id}, {
             "status": "complete",
-            "raw_transcript": {**raw_data, "speakers_info": speakers_info},
+            "raw_transcript": {**raw_data, "speakers_info": speakers_info, "ai_model_info": ai_model_info},
             **insights,
         })
 
@@ -1662,18 +1684,25 @@ def handle_reprocess_insights(data):
     try:
         insights = generate_insights(transcript, title, user_id=user_id, note_length=note_length)
         speakers_info = insights.pop("speakers_info", [])
+        ai_model_info = insights.pop("ai_model_info", {})
+        
+        # Merge model info into existing raw_transcript JSON
+        raw_rows = sb_get("analyses", {"id": analysis_id}, "raw_transcript")
+        existing_raw = (raw_rows[0].get("raw_transcript") or {}) if raw_rows else {}
+        existing_raw["ai_model_info"] = ai_model_info
         
         sb_patch("analyses", {"id": analysis_id}, {
             "status": "complete",
             "error_message": None,
+            "raw_transcript": existing_raw,
             **insights,
         })
         
         if speakers_info and user_id:
             save_identified_speakers(user_id, analysis_id, speakers_info)
         
-        print(f"[reprocess] Completed {analysis_id[:8]}")
-        return {"ok": True, "id": analysis_id}
+        print(f"[reprocess] Completed {analysis_id[:8]} — model: {ai_model_info.get('primary_model', 'unknown')}")
+        return {"ok": True, "id": analysis_id, "ai_model_info": ai_model_info}
     except Exception as e:
         fail_analysis(analysis_id, f"Reprocess error: {str(e)}")
         return {"error": str(e)}
