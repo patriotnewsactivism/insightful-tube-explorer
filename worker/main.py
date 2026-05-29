@@ -518,29 +518,32 @@ CONTENT_FILTER_FALLBACK = "[Content could not be analyzed due to content policy 
 
 
 def _call_gemini(instructions, input_text, max_tokens=2000):
-    """Call Google Gemini via their REST API (free tier)."""
-    contents = []
+    """Call Google Gemini via their OpenAI-compatible API (free tier)."""
+    messages = []
     if instructions:
-        contents.append({"role": "user", "parts": [{"text": f"System instructions: {instructions}"}]})
-        contents.append({"role": "model", "parts": [{"text": "Understood. I will follow those instructions."}]})
+        messages.append({"role": "system", "content": instructions})
     if input_text:
-        contents.append({"role": "user", "parts": [{"text": input_text}]})
+        messages.append({"role": "user", "content": input_text})
     body = {
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": max_tokens,
-            "temperature": 0.3,
-        },
+        "model": GEMINI_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
     req = Request(url, data=json.dumps(body).encode(), headers={
+        "Authorization": f"Bearer {GEMINI_API_KEY}",
         "Content-Type": "application/json",
     }, method="POST")
-    data = json.loads(urlopen(req, timeout=120).read())
-    candidates = data.get("candidates", [])
-    if candidates:
-        parts = candidates[0].get("content", {}).get("parts", [])
-        return "".join(p.get("text", "") for p in parts)
+    try:
+        data = json.loads(urlopen(req, timeout=120).read())
+    except HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:500]
+        print(f"[_call_gemini] HTTP {e.status}: {err_body}")
+        raise RuntimeError(f"Gemini HTTP {e.status}: {err_body}")
+    choices = data.get("choices", [])
+    if choices:
+        return choices[0].get("message", {}).get("content", "")
     return ""
 
 
@@ -562,7 +565,12 @@ def _call_groq(instructions, input_text, max_tokens=2000):
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }, method="POST")
-    data = json.loads(urlopen(req, timeout=120).read())
+    try:
+        data = json.loads(urlopen(req, timeout=120).read())
+    except HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:500]
+        print(f"[_call_groq] HTTP {e.status}: {err_body}")
+        raise RuntimeError(f"Groq HTTP {e.status}: {err_body}")
     choices = data.get("choices", [])
     if choices:
         return choices[0].get("message", {}).get("content", "")
