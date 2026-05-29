@@ -513,45 +513,79 @@ def parse_fast_utterances(result):
 CONTENT_FILTER_FALLBACK = "[Content could not be analyzed due to content policy restrictions on the transcript material.]"
 
 
-def _call_groq(instructions, input_text, max_tokens=2000, model=None):
-    """Call Groq API (free tier). model defaults to GROQ_MODEL."""
-    if not model:
-        model = GROQ_MODEL
+def _call_groq_once(instructions, input_text, max_tokens, model):
+    """Single Groq API call (no retries)."""
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
     if input_text:
         messages.append({"role": "user", "content": input_text})
-    body = {
+    body = json.dumps({
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.3,
-    }
+    }).encode()
     req = Request("https://api.groq.com/openai/v1/chat/completions",
-                  data=json.dumps(body).encode(), headers={
+                  data=body, headers={
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
         "User-Agent": "TubeScribe/1.0",
         "Accept": "application/json",
     }, method="POST")
-    try:
-        data = json.loads(urlopen(req, timeout=120).read())
-    except HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")[:500]
-        print(f"[_call_groq] HTTP {e.status} ({model}): {err_body}")
-        raise RuntimeError(f"Groq HTTP {e.status}: {err_body}")
+    resp = urlopen(req, timeout=120)
+    data = json.loads(resp.read())
     choices = data.get("choices", [])
     if choices:
         return choices[0].get("message", {}).get("content", "")
     return ""
 
 
+def _call_groq(instructions, input_text, max_tokens=2000, model=None):
+    """Call Groq API with automatic retry on rate-limit (429) and transient errors."""
+    if not model:
+        model = GROQ_MODEL
+    max_retries = 4
+    for attempt in range(max_retries):
+        try:
+            return _call_groq_once(instructions, input_text, max_tokens, model)
+        except HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+            status = e.status if hasattr(e, 'status') else getattr(e, 'code', 0)
+            print(f"[_call_groq] HTTP {status} ({model}) attempt {attempt+1}/{max_retries}: {err_body[:200]}")
+            # Retry on rate-limit (429), server errors (500+), and Cloudflare blocks (403/1010)
+            if status in (429, 500, 502, 503, 504) or (status == 403 and "1010" in err_body):
+                wait = (2 ** attempt) + 1  # 2s, 3s, 5s, 9s
+                print(f"[_call_groq] Retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Groq HTTP {status}: {err_body}")
+        except Exception as e:
+            print(f"[_call_groq] Non-HTTP error ({model}) attempt {attempt+1}: {str(e)[:200]}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    raise RuntimeError(f"Groq {model} failed after {max_retries} retries")
+
+
+# Global lock to stagger parallel calls and avoid rate limit bursts
+_groq_call_lock = __import__('threading').Lock()
+_groq_last_call = [0.0]  # mutable container for last call timestamp
+
 def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
     """Route to Groq primary (Llama 3.3 70B) → Groq fallback (Llama 4 Scout).
+    Staggers parallel calls by 0.5s to avoid rate limit bursts.
     If _track_model is a list, appends the name of the model that succeeded."""
     if not USE_GROQ:
         raise RuntimeError("GROQ_API_KEY not set — cannot call AI models")
+    # Stagger parallel calls: wait until 0.5s after the last call started
+    with _groq_call_lock:
+        now = time.time()
+        wait_until = _groq_last_call[0] + 0.5
+        if now < wait_until:
+            time.sleep(wait_until - now)
+        _groq_last_call[0] = time.time()
     # Primary: Llama 3.3 70B
     try:
         result = _call_groq(instructions, input_text, max_tokens, model=GROQ_MODEL)
@@ -1537,7 +1571,7 @@ class Handler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps({
-            "status": "ok", "version": "v10", "supadata": supadata,
+            "status": "ok", "version": "v11", "supadata": supadata,
             "ai_primary": f"groq ({GROQ_MODEL})" if USE_GROQ else "none",
             "ai_fallback": f"groq ({GROQ_FALLBACK})" if USE_GROQ else "none"
         }).encode())
