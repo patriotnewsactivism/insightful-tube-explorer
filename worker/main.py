@@ -1,12 +1,13 @@
 """
 TubeScribe: Audio Worker v8
 Pipeline: Pasted transcript → Supadata API → YouTube captions fallback
-         → Azure OpenAI insights (parallel)
+         → AI insights (parallel)
 
 v6: Supadata API integration
 v7: Speaker ID, polished transcript, AI chat, export
 v8: Fact extraction, entity extraction, cross-video search, bulk support
 v8.1: Quote extraction, timeline builder, contradiction detector
+v9: Replaced Azure AI with free alternatives (Google Gemini + Groq)
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -21,25 +22,15 @@ from concurrent.futures import ThreadPoolExecutor
 # ── Env vars ────────────────────────────────────────────────────────────────
 SUPABASE_URL             = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-AZURE_SPEECH_ENDPOINT    = os.environ.get("AZURE_SPEECH_ENDPOINT", "https://eastus.api.cognitive.microsoft.com/")
-AZURE_SPEECH_KEY         = os.environ.get("AZURE_SPEECH_API_KEY", "")
-AZURE_STORAGE_CONN       = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
-AZURE_STORAGE_ACCOUNT    = "wtptranscriptionstorage"
-AZURE_STORAGE_CONTAINER  = "transcriptions"
-AZURE_OPENAI_KEY         = os.environ.get("AZURE_OPENAI_API_KEY", "")
-AZURE_OPENAI_DEPLOYMENT  = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
+# ── Google Gemini (primary — free tier: 15 RPM, 1500 RPD) ───────────────────
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+USE_GEMINI       = bool(GEMINI_API_KEY)
 
-# ── Grok (primary model via Azure AI Foundry) ───────────────────────────────
-GROK_ENDPOINT = os.environ.get("GROK_ENDPOINT", "https://patri-mojrzk25-swedencentral.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview")
-GROK_API_KEY  = os.environ.get("GROK_API_KEY", "")
-GROK_MODEL    = os.environ.get("GROK_MODEL", "grok-4-1-fast-reasoning")
-USE_GROK      = bool(GROK_API_KEY)  # auto-enable if key is set
-
-# ── DeepSeek V3.2 (fallback model via Azure AI Foundry) ─────────────────────
-DEEPSEEK_ENDPOINT = os.environ.get("DEEPSEEK_ENDPOINT", "https://patri-moar8a1w-eastus2.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview")
-DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_MODEL    = os.environ.get("DEEPSEEK_MODEL", "DeepSeek-V3-2")
-USE_DEEPSEEK      = bool(DEEPSEEK_API_KEY)  # auto-enable if key is set
+# ── Groq (fallback — free tier: 30 RPM, fast inference) ─────────────────────
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL       = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+USE_GROQ         = bool(GROQ_API_KEY)
 SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
 
@@ -523,25 +514,52 @@ def parse_fast_utterances(result):
     return utterances
 
 # ── AI Model Calls ───────────────────────────────────────────────────────────
-OPENAI_URL = "https://openaiyoutube.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
-
-CONTENT_FILTER_FALLBACK = "[Content filtered by Azure — this section could not be analyzed due to content policy restrictions on the transcript material.]"
+CONTENT_FILTER_FALLBACK = "[Content could not be analyzed due to content policy restrictions on the transcript material.]"
 
 
-def _call_grok(instructions, input_text, max_tokens=2000):
-    """Call Grok via Azure AI Foundry (standard chat/completions format)."""
+def _call_gemini(instructions, input_text, max_tokens=2000):
+    """Call Google Gemini via their REST API (free tier)."""
+    contents = []
+    if instructions:
+        contents.append({"role": "user", "parts": [{"text": f"System instructions: {instructions}"}]})
+        contents.append({"role": "model", "parts": [{"text": "Understood. I will follow those instructions."}]})
+    if input_text:
+        contents.append({"role": "user", "parts": [{"text": input_text}]})
+    body = {
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.3,
+        },
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    req = Request(url, data=json.dumps(body).encode(), headers={
+        "Content-Type": "application/json",
+    }, method="POST")
+    data = json.loads(urlopen(req, timeout=120).read())
+    candidates = data.get("candidates", [])
+    if candidates:
+        parts = candidates[0].get("content", {}).get("parts", [])
+        return "".join(p.get("text", "") for p in parts)
+    return ""
+
+
+def _call_groq(instructions, input_text, max_tokens=2000):
+    """Call Groq API (free tier — Llama 3.3 70B, very fast)."""
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
     if input_text:
         messages.append({"role": "user", "content": input_text})
     body = {
-        "model": GROK_MODEL,
+        "model": GROQ_MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
+        "temperature": 0.3,
     }
-    req = Request(GROK_ENDPOINT, data=json.dumps(body).encode(), headers={
-        "Authorization": f"Bearer {GROK_API_KEY}",
+    req = Request("https://api.groq.com/openai/v1/chat/completions",
+                  data=json.dumps(body).encode(), headers={
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }, method="POST")
     data = json.loads(urlopen(req, timeout=120).read())
@@ -549,88 +567,41 @@ def _call_grok(instructions, input_text, max_tokens=2000):
     if choices:
         return choices[0].get("message", {}).get("content", "")
     return ""
-
-
-def _call_deepseek(instructions, input_text, max_tokens=2000):
-    """Call DeepSeek V3.2 via Azure AI Foundry Chat Completions API (fallback)."""
-    body = {
-        "messages": [
-            {"role": "system", "content": instructions},
-            {"role": "user", "content": input_text},
-        ],
-        "max_tokens": max_tokens,
-        "model": DEEPSEEK_MODEL,
-    }
-    req = Request(DEEPSEEK_ENDPOINT, data=json.dumps(body).encode(), headers={
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }, method="POST")
-    data = json.loads(urlopen(req, timeout=120).read())
-    choices = data.get("choices", [])
-    if choices:
-        return choices[0].get("message", {}).get("content", "")
-    return ""
-
-
-def _call_azure_openai(instructions, input_text, max_tokens=2000):
-    """Call Azure OpenAI Responses API (legacy fallback)."""
-    body = {
-        "model": AZURE_OPENAI_DEPLOYMENT, "instructions": instructions,
-        "input": input_text, "max_output_tokens": max_tokens,
-    }
-    req = Request(OPENAI_URL, data=json.dumps(body).encode(), headers={
-        "api-key": AZURE_OPENAI_KEY, "Content-Type": "application/json",
-    }, method="POST")
-    data = json.loads(urlopen(req).read())
-    for item in data.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                if block.get("type") == "output_text":
-                    return block["text"]
-    return data.get("output_text", "")
 
 
 def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
-    """Route to Grok (primary) → DeepSeek V3.2 (fallback) → Azure OpenAI (last resort).
+    """Route to Gemini (primary) → Groq (fallback).
     If _track_model is a list, appends the name of the model that succeeded."""
-    if USE_GROK:
+    # Primary: Google Gemini (free tier)
+    if USE_GEMINI:
         try:
-            result = _call_grok(instructions, input_text, max_tokens)
+            result = _call_gemini(instructions, input_text, max_tokens)
             if result:
                 if isinstance(_track_model, list):
-                    _track_model.append("Grok 4.1 Fast")
+                    _track_model.append(f"Gemini ({GEMINI_MODEL})")
                 return result
-            print("[call_openai] Grok returned empty, falling back to DeepSeek V3.2")
+            print("[call_openai] Gemini returned empty, falling back to Groq")
         except Exception as e:
             err_str = str(e)
-            print(f"[call_openai] Grok failed: {err_str[:300]}, falling back to DeepSeek V3.2")
-    # Fallback 1: DeepSeek V3.2
-    if USE_DEEPSEEK:
+            print(f"[call_openai] Gemini failed: {err_str[:300]}, falling back to Groq")
+    # Fallback: Groq (free tier)
+    if USE_GROQ:
         try:
-            result = _call_deepseek(instructions, input_text, max_tokens)
+            result = _call_groq(instructions, input_text, max_tokens)
             if result:
                 if isinstance(_track_model, list):
-                    _track_model.append("DeepSeek V3.2")
+                    _track_model.append(f"Groq ({GROQ_MODEL})")
                 return result
-            print("[call_openai] DeepSeek returned empty, falling back to Azure OpenAI")
+            print("[call_openai] Groq returned empty")
         except Exception as e:
             err_str = str(e)
-            print(f"[call_openai] DeepSeek failed: {err_str[:300]}, falling back to Azure OpenAI")
-    # Fallback 2: Azure OpenAI (last resort)
-    try:
-        result = _call_azure_openai(instructions, input_text, max_tokens)
-        if isinstance(_track_model, list):
-            _track_model.append("GPT-5 Mini (Azure)")
-        return result
-    except HTTPError as e:
-        body_bytes = e.read()
-        body_str = body_bytes.decode("utf-8", errors="replace") if isinstance(body_bytes, bytes) else str(body_bytes)
-        if e.status == 400 and "content_filter" in body_str:
-            print(f"[call_openai] Content filter triggered, returning fallback. Details: {body_str[:300]}")
-            if isinstance(_track_model, list):
-                _track_model.append("content_filter_fallback")
-            return CONTENT_FILTER_FALLBACK
-        raise RuntimeError(f"Azure OpenAI failed ({e.status}): {body_str}")
+            if "content_filter" in err_str.lower() or "moderation" in err_str.lower():
+                print(f"[call_openai] Content filter triggered: {err_str[:300]}")
+                if isinstance(_track_model, list):
+                    _track_model.append("content_filter_fallback")
+                return CONTENT_FILTER_FALLBACK
+            print(f"[call_openai] Groq failed: {err_str[:300]}")
+    raise RuntimeError("All AI models failed — check GEMINI_API_KEY and GROQ_API_KEY env vars")
 
 def get_known_speakers(user_id):
     """Fetch known speakers for this user to help with identification."""
@@ -1568,7 +1539,9 @@ class Handler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps({
-            "status": "ok", "version": "v8", "supadata": supadata
+            "status": "ok", "version": "v9", "supadata": supadata,
+            "ai_primary": f"gemini ({GEMINI_MODEL})" if USE_GEMINI else "none",
+            "ai_fallback": f"groq ({GROQ_MODEL})" if USE_GROQ else "none"
         }).encode())
 
     def do_POST(self):
