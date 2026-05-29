@@ -532,6 +532,8 @@ def _call_groq(instructions, input_text, max_tokens=2000, model=None):
                   data=json.dumps(body).encode(), headers={
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
+        "User-Agent": "TubeScribe/1.0",
+        "Accept": "application/json",
     }, method="POST")
     try:
         data = json.loads(urlopen(req, timeout=120).read())
