@@ -1509,6 +1509,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        path = self.path.rstrip("/")
+        # ── Test AI endpoint ──
+        if path == "/test-ai":
+            result = {"groq_key_set": bool(GROQ_API_KEY), "groq_key_prefix": GROQ_API_KEY[:8] + "..." if GROQ_API_KEY else "none"}
+            try:
+                out = _call_groq("You are a helpful assistant.", "Say 'AI working' in exactly two words.", 20, model=GROQ_MODEL)
+                result["primary"] = {"status": "ok", "model": GROQ_MODEL, "response": out[:100]}
+            except Exception as e:
+                result["primary"] = {"status": "error", "model": GROQ_MODEL, "error": str(e)[:300]}
+            try:
+                out2 = _call_groq("You are a helpful assistant.", "Say 'AI working' in exactly two words.", 20, model=GROQ_FALLBACK)
+                result["fallback"] = {"status": "ok", "model": GROQ_FALLBACK, "response": out2[:100]}
+            except Exception as e:
+                result["fallback"] = {"status": "error", "model": GROQ_FALLBACK, "error": str(e)[:300]}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result, indent=2).encode())
+            return
         supadata = "yes" if SUPADATA_API_KEY else "no"
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
