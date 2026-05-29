@@ -26,14 +26,18 @@ SUPABASE_SERVICE_ROLE    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 # ── AI provider config (Cerebras preferred: 1M tokens/day free) ─────────────
 CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 CEREBRAS_MODEL   = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
+# ── OpenRouter (free tier: 27 free models, Google login) ───────────────────
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash:free")
 # ── Groq (fallback — free tier: 100K tokens/day) ───────────────────────────
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL       = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FALLBACK    = os.environ.get("GROQ_FALLBACK_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 USE_GROQ         = bool(GROQ_API_KEY)
 USE_CEREBRAS     = bool(CEREBRAS_API_KEY)
+USE_OPENROUTER   = bool(OPENROUTER_API_KEY)
 # Which provider to try first
-AI_PROVIDER      = "cerebras" if USE_CEREBRAS else "groq"
+AI_PROVIDER      = "cerebras" if USE_CEREBRAS else ("openrouter" if USE_OPENROUTER else "groq")
 SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
 
@@ -521,7 +525,7 @@ CONTENT_FILTER_FALLBACK = "[Content could not be analyzed due to content policy 
 
 
 def _call_api_once(instructions, input_text, max_tokens, model, provider="groq"):
-    """Single API call to Groq or Cerebras (no retries)."""
+    """Single API call to Groq, Cerebras, or OpenRouter (no retries)."""
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
@@ -536,16 +540,23 @@ def _call_api_once(instructions, input_text, max_tokens, model, provider="groq")
     if provider == "cerebras":
         url = "https://api.cerebras.ai/v1/chat/completions"
         api_key = CEREBRAS_API_KEY
+    elif provider == "openrouter":
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        api_key = OPENROUTER_API_KEY
     else:
         url = "https://api.groq.com/openai/v1/chat/completions"
         api_key = GROQ_API_KEY
-    req = Request(url, data=body, headers={
+    headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "User-Agent": "TubeScribe/1.0",
         "Accept": "application/json",
-    }, method="POST")
-    resp = urlopen(req, timeout=120)
+    }
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "https://tubescribe.donmatthews.live"
+        headers["X-Title"] = "TubeScribe"
+    req = Request(url, data=body, headers=headers, method="POST")
+    resp = urlopen(req, timeout=180)
     data = json.loads(resp.read())
     choices = data.get("choices", [])
     if choices:
@@ -592,13 +603,13 @@ _ai_call_lock = __import__('threading').Lock()
 _ai_last_call = [0.0]  # mutable container for last call timestamp
 
 def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
-    """Route to best available AI: Cerebras → Groq primary → Groq fallback.
+    """Route to best available AI: Cerebras → OpenRouter → Groq primary → Groq fallback.
     Staggers parallel calls to avoid rate limit bursts.
     If _track_model is a list, appends the name of the model that succeeded."""
-    if not USE_CEREBRAS and not USE_GROQ:
-        raise RuntimeError("No AI API key set — set CEREBRAS_API_KEY or GROQ_API_KEY")
-    # Stagger: Cerebras needs 0.3s, Groq needs 1.5s
-    stagger = 0.3 if AI_PROVIDER == "cerebras" else 1.5
+    if not USE_CEREBRAS and not USE_OPENROUTER and not USE_GROQ:
+        raise RuntimeError("No AI API key set — set CEREBRAS_API_KEY, OPENROUTER_API_KEY, or GROQ_API_KEY")
+    # Stagger: Cerebras 0.3s, OpenRouter 0.5s, Groq 1.5s
+    stagger = 0.3 if AI_PROVIDER == "cerebras" else (0.5 if AI_PROVIDER == "openrouter" else 1.5)
     with _ai_call_lock:
         now = time.time()
         wait_until = _ai_last_call[0] + stagger
@@ -616,10 +627,23 @@ def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
                 if isinstance(_track_model, list):
                     _track_model.append(f"Cerebras ({CEREBRAS_MODEL})")
                 return result
-            print(f"[call_openai] Cerebras returned empty, trying Groq")
+            print(f"[call_openai] Cerebras returned empty, trying next")
         except Exception as e:
             errors.append(f"Cerebras: {str(e)[:200]}")
-            print(f"[call_openai] Cerebras failed: {str(e)[:300]}, trying Groq")
+            print(f"[call_openai] Cerebras failed: {str(e)[:300]}, trying next")
+
+    # Try OpenRouter (free models, generous limits)
+    if USE_OPENROUTER:
+        try:
+            result = _call_with_retries(instructions, input_text, max_tokens, model=OPENROUTER_MODEL, provider="openrouter")
+            if result:
+                if isinstance(_track_model, list):
+                    _track_model.append(f"OpenRouter ({OPENROUTER_MODEL})")
+                return result
+            print(f"[call_openai] OpenRouter returned empty, trying Groq")
+        except Exception as e:
+            errors.append(f"OpenRouter: {str(e)[:200]}")
+            print(f"[call_openai] OpenRouter failed: {str(e)[:300]}, trying Groq")
 
     # Groq primary
     if USE_GROQ:
@@ -654,7 +678,7 @@ def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
 
     error_detail = "; ".join(errors) if errors else "No AI providers configured"
     if "daily token limit" in error_detail.lower():
-        raise RuntimeError(f"Daily AI token limit reached. Resets in a few hours. ({error_detail})")
+        raise RuntimeError(f"Daily AI token limit reached. Resets at midnight UTC (~6 PM CST). ({error_detail})")
     raise RuntimeError(f"All AI models failed: {error_detail}")
 
 def get_known_speakers(user_id):
@@ -1640,10 +1664,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self._cors_headers()
         self.end_headers()
-        ai_primary = f"cerebras ({CEREBRAS_MODEL})" if USE_CEREBRAS else (f"groq ({GROQ_MODEL})" if USE_GROQ else "none")
-        ai_fallback = f"groq ({GROQ_MODEL})" if USE_GROQ and USE_CEREBRAS else (f"groq ({GROQ_FALLBACK})" if USE_GROQ else "none")
+        if USE_CEREBRAS:
+            ai_primary = f"cerebras ({CEREBRAS_MODEL})"
+        elif USE_OPENROUTER:
+            ai_primary = f"openrouter ({OPENROUTER_MODEL})"
+        elif USE_GROQ:
+            ai_primary = f"groq ({GROQ_MODEL})"
+        else:
+            ai_primary = "none"
+        fallbacks = []
+        if USE_OPENROUTER and AI_PROVIDER != "openrouter":
+            fallbacks.append(f"openrouter ({OPENROUTER_MODEL})")
+        if USE_GROQ:
+            fallbacks.append(f"groq ({GROQ_MODEL})")
+        ai_fallback = " → ".join(fallbacks) if fallbacks else "none"
         self.wfile.write(json.dumps({
-            "status": "ok", "version": "v12", "supadata": supadata,
+            "status": "ok", "version": "v13", "supadata": supadata,
             "ai_provider": AI_PROVIDER,
             "ai_primary": ai_primary,
             "ai_fallback": ai_fallback,
