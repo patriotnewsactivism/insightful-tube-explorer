@@ -555,8 +555,9 @@ def _call_groq(instructions, input_text, max_tokens=2000, model=None):
             print(f"[_call_groq] HTTP {status} ({model}) attempt {attempt+1}/{max_retries}: {err_body[:200]}")
             # Retry on rate-limit (429), server errors (500+), and Cloudflare blocks (403/1010)
             if status in (429, 500, 502, 503, 504) or (status == 403 and "1010" in err_body):
-                wait = (2 ** attempt) + 1  # 2s, 3s, 5s, 9s
-                print(f"[_call_groq] Retrying in {wait}s...")
+                import random
+                wait = (2 ** attempt) + 1 + random.uniform(0, 1)  # 2-3s, 3-4s, 5-6s, 9-10s with jitter
+                print(f"[_call_groq] Retrying in {wait:.1f}s...")
                 time.sleep(wait)
                 continue
             raise RuntimeError(f"Groq HTTP {status}: {err_body}")
@@ -579,10 +580,10 @@ def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
     If _track_model is a list, appends the name of the model that succeeded."""
     if not USE_GROQ:
         raise RuntimeError("GROQ_API_KEY not set — cannot call AI models")
-    # Stagger parallel calls: wait until 0.5s after the last call started
+    # Stagger parallel calls: wait until 1s after the last call started
     with _groq_call_lock:
         now = time.time()
-        wait_until = _groq_last_call[0] + 0.5
+        wait_until = _groq_last_call[0] + 1.0
         if now < wait_until:
             time.sleep(wait_until - now)
         _groq_last_call[0] = time.time()
@@ -760,7 +761,8 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
     t0 = time.time()
     # Track which model handled each call
     model_trackers = [[] for _ in prompts]
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    # Run max 2 at a time to stay within Groq free-tier token window (12K tokens)
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(call_openai, p[0], p[1], token_limits.get(i, 4000), model_trackers[i]) for i, p in enumerate(prompts)]
         results = [f.result() for f in futures]
     elapsed = time.time() - t0
