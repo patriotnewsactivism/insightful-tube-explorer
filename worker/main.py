@@ -8,6 +8,7 @@ v7: Speaker ID, polished transcript, AI chat, export
 v8: Fact extraction, entity extraction, cross-video search, bulk support
 v8.1: Quote extraction, timeline builder, contradiction detector
 v9: Replaced Azure AI with free alternatives (Google Gemini + Groq)
+v12: Cerebras support (1M tokens/day free), optimized prompt sizes, robust rate limiting
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -22,11 +23,17 @@ from concurrent.futures import ThreadPoolExecutor
 # ── Env vars ────────────────────────────────────────────────────────────────
 SUPABASE_URL             = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-# ── Groq (primary — free tier: 30 RPM, fast inference) ──────────────────────
+# ── AI provider config (Cerebras preferred: 1M tokens/day free) ─────────────
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+CEREBRAS_MODEL   = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
+# ── Groq (fallback — free tier: 100K tokens/day) ───────────────────────────
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL       = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FALLBACK    = os.environ.get("GROQ_FALLBACK_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 USE_GROQ         = bool(GROQ_API_KEY)
+USE_CEREBRAS     = bool(CEREBRAS_API_KEY)
+# Which provider to try first
+AI_PROVIDER      = "cerebras" if USE_CEREBRAS else "groq"
 SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
 
@@ -513,8 +520,8 @@ def parse_fast_utterances(result):
 CONTENT_FILTER_FALLBACK = "[Content could not be analyzed due to content policy restrictions on the transcript material.]"
 
 
-def _call_groq_once(instructions, input_text, max_tokens, model):
-    """Single Groq API call (no retries)."""
+def _call_api_once(instructions, input_text, max_tokens, model, provider="groq"):
+    """Single API call to Groq or Cerebras (no retries)."""
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
@@ -526,9 +533,14 @@ def _call_groq_once(instructions, input_text, max_tokens, model):
         "max_tokens": max_tokens,
         "temperature": 0.3,
     }).encode()
-    req = Request("https://api.groq.com/openai/v1/chat/completions",
-                  data=body, headers={
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+    if provider == "cerebras":
+        url = "https://api.cerebras.ai/v1/chat/completions"
+        api_key = CEREBRAS_API_KEY
+    else:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        api_key = GROQ_API_KEY
+    req = Request(url, data=body, headers={
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "User-Agent": "TubeScribe/1.0",
         "Accept": "application/json",
@@ -541,80 +553,109 @@ def _call_groq_once(instructions, input_text, max_tokens, model):
     return ""
 
 
-def _call_groq(instructions, input_text, max_tokens=2000, model=None):
-    """Call Groq API with automatic retry on rate-limit (429) and transient errors."""
+def _call_with_retries(instructions, input_text, max_tokens=2000, model=None, provider="groq"):
+    """Call AI API with retry on rate-limit (429) and transient errors."""
+    import random
     if not model:
-        model = GROQ_MODEL
-    max_retries = 4
+        model = CEREBRAS_MODEL if provider == "cerebras" else GROQ_MODEL
+    max_retries = 5
     for attempt in range(max_retries):
         try:
-            return _call_groq_once(instructions, input_text, max_tokens, model)
+            return _call_api_once(instructions, input_text, max_tokens, model, provider)
         except HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")[:500]
             status = e.status if hasattr(e, 'status') else getattr(e, 'code', 0)
-            print(f"[_call_groq] HTTP {status} ({model}) attempt {attempt+1}/{max_retries}: {err_body[:200]}")
-            # Retry on rate-limit (429), server errors (500+), and Cloudflare blocks (403/1010)
-            if status in (429, 500, 502, 503, 504) or (status == 403 and "1010" in err_body):
-                import random
-                wait = (2 ** attempt) + 1 + random.uniform(0, 1)  # 2-3s, 3-4s, 5-6s, 9-10s with jitter
-                print(f"[_call_groq] Retrying in {wait:.1f}s...")
+            print(f"[_call_{provider}] HTTP {status} ({model}) attempt {attempt+1}/{max_retries}: {err_body[:200]}")
+            # Retry on rate-limit (429/413), server errors (500+), and Cloudflare blocks (403/1010)
+            if status in (429, 413, 500, 502, 503, 504) or (status == 403 and "1010" in err_body):
+                # If daily limit hit, don't waste time retrying
+                if "tokens per day" in err_body.lower() or "daily" in err_body.lower():
+                    raise RuntimeError(f"{provider} daily token limit reached: {err_body[:200]}")
+                wait = (2 ** attempt) + 1 + random.uniform(0, 2)
+                print(f"[_call_{provider}] Retrying in {wait:.1f}s...")
                 time.sleep(wait)
                 continue
-            raise RuntimeError(f"Groq HTTP {status}: {err_body}")
+            raise RuntimeError(f"{provider} HTTP {status}: {err_body}")
         except Exception as e:
-            print(f"[_call_groq] Non-HTTP error ({model}) attempt {attempt+1}: {str(e)[:200]}")
+            if "daily token limit" in str(e).lower():
+                raise
+            print(f"[_call_{provider}] Non-HTTP error ({model}) attempt {attempt+1}: {str(e)[:200]}")
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(2 ** attempt + random.uniform(0, 1))
                 continue
             raise
-    raise RuntimeError(f"Groq {model} failed after {max_retries} retries")
+    raise RuntimeError(f"{provider} {model} failed after {max_retries} retries")
 
 
 # Global lock to stagger parallel calls and avoid rate limit bursts
-_groq_call_lock = __import__('threading').Lock()
-_groq_last_call = [0.0]  # mutable container for last call timestamp
+_ai_call_lock = __import__('threading').Lock()
+_ai_last_call = [0.0]  # mutable container for last call timestamp
 
 def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
-    """Route to Groq primary (Llama 3.3 70B) → Groq fallback (Llama 4 Scout).
-    Staggers parallel calls by 0.5s to avoid rate limit bursts.
+    """Route to best available AI: Cerebras → Groq primary → Groq fallback.
+    Staggers parallel calls to avoid rate limit bursts.
     If _track_model is a list, appends the name of the model that succeeded."""
-    if not USE_GROQ:
-        raise RuntimeError("GROQ_API_KEY not set — cannot call AI models")
-    # Stagger parallel calls: wait until 1s after the last call started
-    with _groq_call_lock:
+    if not USE_CEREBRAS and not USE_GROQ:
+        raise RuntimeError("No AI API key set — set CEREBRAS_API_KEY or GROQ_API_KEY")
+    # Stagger: Cerebras needs 0.3s, Groq needs 1.5s
+    stagger = 0.3 if AI_PROVIDER == "cerebras" else 1.5
+    with _ai_call_lock:
         now = time.time()
-        wait_until = _groq_last_call[0] + 1.0
+        wait_until = _ai_last_call[0] + stagger
         if now < wait_until:
             time.sleep(wait_until - now)
-        _groq_last_call[0] = time.time()
-    # Primary: Llama 3.3 70B
-    try:
-        result = _call_groq(instructions, input_text, max_tokens, model=GROQ_MODEL)
-        if result:
-            if isinstance(_track_model, list):
-                _track_model.append(f"Groq ({GROQ_MODEL})")
-            return result
-        print(f"[call_openai] {GROQ_MODEL} returned empty, trying fallback")
-    except Exception as e:
-        err_str = str(e)
-        print(f"[call_openai] {GROQ_MODEL} failed: {err_str[:300]}, trying fallback")
-    # Fallback: Llama 4 Scout
-    try:
-        result = _call_groq(instructions, input_text, max_tokens, model=GROQ_FALLBACK)
-        if result:
-            if isinstance(_track_model, list):
-                _track_model.append(f"Groq ({GROQ_FALLBACK})")
-            return result
-        print(f"[call_openai] {GROQ_FALLBACK} also returned empty")
-    except Exception as e:
-        err_str = str(e)
-        if "content_filter" in err_str.lower() or "moderation" in err_str.lower():
-            print(f"[call_openai] Content filter triggered: {err_str[:300]}")
-            if isinstance(_track_model, list):
-                _track_model.append("content_filter_fallback")
-            return CONTENT_FILTER_FALLBACK
-        print(f"[call_openai] {GROQ_FALLBACK} also failed: {err_str[:300]}")
-    raise RuntimeError("All AI models failed — check GROQ_API_KEY env var")
+        _ai_last_call[0] = time.time()
+
+    errors = []
+
+    # Try Cerebras first if available (1M tokens/day free!)
+    if USE_CEREBRAS:
+        try:
+            result = _call_with_retries(instructions, input_text, max_tokens, model=CEREBRAS_MODEL, provider="cerebras")
+            if result:
+                if isinstance(_track_model, list):
+                    _track_model.append(f"Cerebras ({CEREBRAS_MODEL})")
+                return result
+            print(f"[call_openai] Cerebras returned empty, trying Groq")
+        except Exception as e:
+            errors.append(f"Cerebras: {str(e)[:200]}")
+            print(f"[call_openai] Cerebras failed: {str(e)[:300]}, trying Groq")
+
+    # Groq primary
+    if USE_GROQ:
+        try:
+            result = _call_with_retries(instructions, input_text, max_tokens, model=GROQ_MODEL, provider="groq")
+            if result:
+                if isinstance(_track_model, list):
+                    _track_model.append(f"Groq ({GROQ_MODEL})")
+                return result
+            print(f"[call_openai] {GROQ_MODEL} returned empty, trying fallback")
+        except Exception as e:
+            errors.append(f"Groq primary: {str(e)[:200]}")
+            print(f"[call_openai] {GROQ_MODEL} failed: {str(e)[:300]}, trying fallback")
+
+        # Groq fallback
+        try:
+            result = _call_with_retries(instructions, input_text, max_tokens, model=GROQ_FALLBACK, provider="groq")
+            if result:
+                if isinstance(_track_model, list):
+                    _track_model.append(f"Groq ({GROQ_FALLBACK})")
+                return result
+            print(f"[call_openai] {GROQ_FALLBACK} also returned empty")
+        except Exception as e:
+            err_str = str(e)
+            errors.append(f"Groq fallback: {err_str[:200]}")
+            if "content_filter" in err_str.lower() or "moderation" in err_str.lower():
+                print(f"[call_openai] Content filter triggered: {err_str[:300]}")
+                if isinstance(_track_model, list):
+                    _track_model.append("content_filter_fallback")
+                return CONTENT_FILTER_FALLBACK
+            print(f"[call_openai] {GROQ_FALLBACK} also failed: {err_str[:300]}")
+
+    error_detail = "; ".join(errors) if errors else "No AI providers configured"
+    if "daily token limit" in error_detail.lower():
+        raise RuntimeError(f"Daily AI token limit reached. Resets in a few hours. ({error_detail})")
+    raise RuntimeError(f"All AI models failed: {error_detail}")
 
 def get_known_speakers(user_id):
     """Fetch known speakers for this user to help with identification."""
@@ -707,6 +748,10 @@ def generate_insights(transcript, title, description="", user_id=None, note_leng
     if description:
         ctx += f'Video description: "{description[:500]}"\n\n'
     t = transcript[:60000]
+    # Optimized sizes: not every prompt needs the full transcript
+    t_short = transcript[:15000]   # ~3.7K tokens — enough for summary, sentiment, date, speakers
+    t_medium = transcript[:30000]  # ~7.5K tokens — for notes
+    t_full = transcript[:60000]    # ~15K tokens — only for polished transcript
 
     # Get known speakers for context
     known_speakers = get_known_speakers(user_id) if user_id else []
@@ -720,13 +765,13 @@ def generate_insights(transcript, title, description="", user_id=None, note_leng
 
     prompts = [
         (f"{research_ctx}\n\nProduce a thorough summary of this video. Include: the main topic, all key points discussed, names of people and organizations mentioned, any legal proceedings or events described, and the overall significance. Be detailed — aim for 2-3 paragraphs, not just a few sentences.",
-         f"{ctx}Transcript:\n{t}"),
+         f"{ctx}Transcript:\n{t_short}"),
         (f'{research_ctx}\n\nAnalyze the tone and return ONLY valid JSON (no markdown): {{"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}}',
-         f"{ctx}Transcript:\n{t}"),
+         f"{ctx}Transcript:\n{t_short}"),
         (_get_notes_prompt(research_ctx, note_length),
-         f"{ctx}Transcript:\n{t}"),
+         f"{ctx}Transcript:\n{t_medium}"),
         (f'{research_ctx}\n\nAnalyze for clues about when this content was produced. Return ONLY valid JSON (no markdown): {{"likely_production_date":"<date range>","reasoning":"<brief>"}}',
-         f"{ctx}Transcript:\n{t}"),
+         f"{ctx}Transcript:\n{t_short}"),
         # 5th call: Speaker-aware polished transcript (placeholder — may be replaced by chunked version below)
         (f'''{research_ctx}
 
@@ -751,7 +796,7 @@ Identify all speakers in this transcript for research indexing. Return ONLY vali
 {{"speakers": [{{"label": "Speaker 1", "likely_name": "name or null", "role": "brief role description", "speaking_percentage": 0-100, "key_quotes": ["notable quote 1"]}}]}}
 
 Look for: names mentioned in conversation, self-references, titles, the video creator/recorder.{speaker_ctx}''',
-         f"{ctx}Transcript:\n{t}"),
+         f"{ctx}Transcript:\n{t_short}"),
     ]
 
     # Token limits per call: polished transcript & notes get 16K, others get 4K
@@ -1595,10 +1640,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self._cors_headers()
         self.end_headers()
+        ai_primary = f"cerebras ({CEREBRAS_MODEL})" if USE_CEREBRAS else (f"groq ({GROQ_MODEL})" if USE_GROQ else "none")
+        ai_fallback = f"groq ({GROQ_MODEL})" if USE_GROQ and USE_CEREBRAS else (f"groq ({GROQ_FALLBACK})" if USE_GROQ else "none")
         self.wfile.write(json.dumps({
-            "status": "ok", "version": "v11", "supadata": supadata,
-            "ai_primary": f"groq ({GROQ_MODEL})" if USE_GROQ else "none",
-            "ai_fallback": f"groq ({GROQ_FALLBACK})" if USE_GROQ else "none"
+            "status": "ok", "version": "v12", "supadata": supadata,
+            "ai_provider": AI_PROVIDER,
+            "ai_primary": ai_primary,
+            "ai_fallback": ai_fallback,
         }).encode())
 
     def do_POST(self):
