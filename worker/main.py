@@ -22,14 +22,10 @@ from concurrent.futures import ThreadPoolExecutor
 # ── Env vars ────────────────────────────────────────────────────────────────
 SUPABASE_URL             = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-# ── Google Gemini (primary — free tier: 15 RPM, 1500 RPD) ───────────────────
-GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL     = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-USE_GEMINI       = bool(GEMINI_API_KEY)
-
-# ── Groq (fallback — free tier: 30 RPM, fast inference) ─────────────────────
+# ── Groq (primary — free tier: 30 RPM, fast inference) ──────────────────────
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL       = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_FALLBACK    = os.environ.get("GROQ_FALLBACK_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 USE_GROQ         = bool(GROQ_API_KEY)
 SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
@@ -517,45 +513,17 @@ def parse_fast_utterances(result):
 CONTENT_FILTER_FALLBACK = "[Content could not be analyzed due to content policy restrictions on the transcript material.]"
 
 
-def _call_gemini(instructions, input_text, max_tokens=2000):
-    """Call Google Gemini via their OpenAI-compatible API (free tier)."""
+def _call_groq(instructions, input_text, max_tokens=2000, model=None):
+    """Call Groq API (free tier). model defaults to GROQ_MODEL."""
+    if not model:
+        model = GROQ_MODEL
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
     if input_text:
         messages.append({"role": "user", "content": input_text})
     body = {
-        "model": GEMINI_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.3,
-    }
-    url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-    req = Request(url, data=json.dumps(body).encode(), headers={
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
-        "Content-Type": "application/json",
-    }, method="POST")
-    try:
-        data = json.loads(urlopen(req, timeout=120).read())
-    except HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")[:500]
-        print(f"[_call_gemini] HTTP {e.status}: {err_body}")
-        raise RuntimeError(f"Gemini HTTP {e.status}: {err_body}")
-    choices = data.get("choices", [])
-    if choices:
-        return choices[0].get("message", {}).get("content", "")
-    return ""
-
-
-def _call_groq(instructions, input_text, max_tokens=2000):
-    """Call Groq API (free tier — Llama 3.3 70B, very fast)."""
-    messages = []
-    if instructions:
-        messages.append({"role": "system", "content": instructions})
-    if input_text:
-        messages.append({"role": "user", "content": input_text})
-    body = {
-        "model": GROQ_MODEL,
+        "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.3,
@@ -569,7 +537,7 @@ def _call_groq(instructions, input_text, max_tokens=2000):
         data = json.loads(urlopen(req, timeout=120).read())
     except HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
-        print(f"[_call_groq] HTTP {e.status}: {err_body}")
+        print(f"[_call_groq] HTTP {e.status} ({model}): {err_body}")
         raise RuntimeError(f"Groq HTTP {e.status}: {err_body}")
     choices = data.get("choices", [])
     if choices:
@@ -578,38 +546,38 @@ def _call_groq(instructions, input_text, max_tokens=2000):
 
 
 def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
-    """Route to Gemini (primary) → Groq (fallback).
+    """Route to Groq primary (Llama 3.3 70B) → Groq fallback (Llama 4 Scout).
     If _track_model is a list, appends the name of the model that succeeded."""
-    # Primary: Google Gemini (free tier)
-    if USE_GEMINI:
-        try:
-            result = _call_gemini(instructions, input_text, max_tokens)
-            if result:
-                if isinstance(_track_model, list):
-                    _track_model.append(f"Gemini ({GEMINI_MODEL})")
-                return result
-            print("[call_openai] Gemini returned empty, falling back to Groq")
-        except Exception as e:
-            err_str = str(e)
-            print(f"[call_openai] Gemini failed: {err_str[:300]}, falling back to Groq")
-    # Fallback: Groq (free tier)
-    if USE_GROQ:
-        try:
-            result = _call_groq(instructions, input_text, max_tokens)
-            if result:
-                if isinstance(_track_model, list):
-                    _track_model.append(f"Groq ({GROQ_MODEL})")
-                return result
-            print("[call_openai] Groq returned empty")
-        except Exception as e:
-            err_str = str(e)
-            if "content_filter" in err_str.lower() or "moderation" in err_str.lower():
-                print(f"[call_openai] Content filter triggered: {err_str[:300]}")
-                if isinstance(_track_model, list):
-                    _track_model.append("content_filter_fallback")
-                return CONTENT_FILTER_FALLBACK
-            print(f"[call_openai] Groq failed: {err_str[:300]}")
-    raise RuntimeError("All AI models failed — check GEMINI_API_KEY and GROQ_API_KEY env vars")
+    if not USE_GROQ:
+        raise RuntimeError("GROQ_API_KEY not set — cannot call AI models")
+    # Primary: Llama 3.3 70B
+    try:
+        result = _call_groq(instructions, input_text, max_tokens, model=GROQ_MODEL)
+        if result:
+            if isinstance(_track_model, list):
+                _track_model.append(f"Groq ({GROQ_MODEL})")
+            return result
+        print(f"[call_openai] {GROQ_MODEL} returned empty, trying fallback")
+    except Exception as e:
+        err_str = str(e)
+        print(f"[call_openai] {GROQ_MODEL} failed: {err_str[:300]}, trying fallback")
+    # Fallback: Llama 4 Scout
+    try:
+        result = _call_groq(instructions, input_text, max_tokens, model=GROQ_FALLBACK)
+        if result:
+            if isinstance(_track_model, list):
+                _track_model.append(f"Groq ({GROQ_FALLBACK})")
+            return result
+        print(f"[call_openai] {GROQ_FALLBACK} also returned empty")
+    except Exception as e:
+        err_str = str(e)
+        if "content_filter" in err_str.lower() or "moderation" in err_str.lower():
+            print(f"[call_openai] Content filter triggered: {err_str[:300]}")
+            if isinstance(_track_model, list):
+                _track_model.append("content_filter_fallback")
+            return CONTENT_FILTER_FALLBACK
+        print(f"[call_openai] {GROQ_FALLBACK} also failed: {err_str[:300]}")
+    raise RuntimeError("All AI models failed — check GROQ_API_KEY env var")
 
 def get_known_speakers(user_id):
     """Fetch known speakers for this user to help with identification."""
@@ -1547,9 +1515,9 @@ class Handler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps({
-            "status": "ok", "version": "v9", "supadata": supadata,
-            "ai_primary": f"gemini ({GEMINI_MODEL})" if USE_GEMINI else "none",
-            "ai_fallback": f"groq ({GROQ_MODEL})" if USE_GROQ else "none"
+            "status": "ok", "version": "v10", "supadata": supadata,
+            "ai_primary": f"groq ({GROQ_MODEL})" if USE_GROQ else "none",
+            "ai_fallback": f"groq ({GROQ_FALLBACK})" if USE_GROQ else "none"
         }).encode())
 
     def do_POST(self):
