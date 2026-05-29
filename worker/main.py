@@ -28,7 +28,7 @@ CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 CEREBRAS_MODEL   = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
 # ── OpenRouter (free tier: 27 free models, Google login) ───────────────────
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash:free")
+OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b:free")
 # ── Groq (fallback — free tier: 100K tokens/day) ───────────────────────────
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL       = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
