@@ -1565,6 +1565,29 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(result, indent=2).encode())
             return
+        # ── Stress-test AI: 6 parallel calls like real processing ──
+        if path == "/test-ai-parallel":
+            fake_transcript = "This is a test transcript. " * 200  # ~1000 words
+            results = {}
+            def _test_call(label):
+                try:
+                    out = call_openai("Summarize in one sentence.", fake_transcript, 100)
+                    return {"status": "ok", "response": out[:100]}
+                except Exception as e:
+                    return {"status": "error", "error": str(e)[:300]}
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                futs = {ex.submit(_test_call, f"call_{i}"): f"call_{i}" for i in range(6)}
+                for f in futs:
+                    label = futs[f]
+                    results[label] = f.result()
+            ok_count = sum(1 for r in results.values() if r["status"] == "ok")
+            results["summary"] = f"{ok_count}/6 succeeded"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(results, indent=2).encode())
+            return
         supadata = "yes" if SUPADATA_API_KEY else "no"
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
