@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import {
   Loader2, ArrowLeft, AlertCircle, Clock, Users, FileText,
   Sparkles, Calendar, Download, MessageSquare, Send, User,
-  ChevronDown, ChevronUp, Copy, Check, Mic, MicOff, RefreshCw
+  ChevronDown, ChevronUp, Copy, Check, Mic, MicOff, RefreshCw, Pencil
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -73,6 +73,86 @@ function formatSeconds(s: number | null): string {
   const m = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
   return `${m}:${sec.toString().padStart(2, "0")}`;
+}
+
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\*(.+?)\*/g, "$1")
+    .replace(/`(.+?)`/g, "$1")
+    .replace(/^>\s+/gm, "")
+    .replace(/^[-*+]\s+/gm, "• ")
+    .replace(/^\d+\.\s+/gm, "");
+}
+
+function EditableContent({
+  value,
+  analysisId,
+  field,
+  onUpdate,
+  placeholder = "Nothing here yet.",
+}: {
+  value: string | null;
+  analysisId: string;
+  field: string;
+  onUpdate: () => void;
+  placeholder?: string;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [editValue, setEditValue] = useState(value ?? "");
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    setSaving(true);
+    const { error } = await supabase.from("analyses").update({ [field]: editValue } as any).eq("id", analysisId);
+    setSaving(false);
+    if (error) {
+      toast.error(error.message);
+    } else {
+      setEditing(false);
+      onUpdate();
+      toast.success("Saved");
+    }
+  }
+
+  if (editing) {
+    return (
+      <div>
+        <textarea
+          value={editValue}
+          onChange={(e) => setEditValue(e.target.value)}
+          className="w-full text-sm leading-relaxed bg-muted rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-primary/40 resize-y min-h-[200px]"
+          rows={14}
+          autoFocus
+        />
+        <div className="flex gap-2 mt-2">
+          <Button size="sm" onClick={save} disabled={saving} className="gap-1.5">
+            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+            Save
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => { setEditing(false); setEditValue(value ?? ""); }}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative group">
+      <div className="text-sm leading-relaxed whitespace-pre-wrap">
+        {value ? stripMarkdown(value) : <span className="text-muted-foreground">{placeholder}</span>}
+      </div>
+      <button
+        onClick={() => { setEditValue(value ?? ""); setEditing(true); }}
+        className="absolute top-0 right-0 p-1.5 rounded-lg hover:bg-muted text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity"
+        title="Edit"
+      >
+        <Pencil className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -312,9 +392,13 @@ function NotesTab({ analysis, onUpdate }: { analysis: Analysis; onUpdate: () => 
           </Button>
         </div>
       </div>
-      <div className="text-sm leading-relaxed whitespace-pre-wrap prose prose-sm max-w-none">
-        {analysis.expanded_notes ?? "No notes available."}
-      </div>
+      <EditableContent
+        value={analysis.expanded_notes}
+        analysisId={analysis.id}
+        field="expanded_notes"
+        onUpdate={onUpdate}
+        placeholder="No notes available."
+      />
     </div>
   );
 }
@@ -488,22 +572,76 @@ function AIChatPanel({ analysisId, onUpdate }: { analysisId: string; onUpdate: (
 }
 
 // ── Polished Transcript View ─────────────────────────────────────────────────
-function PolishedTranscriptView({ transcript }: { transcript: string | null }) {
+function PolishedTranscriptView({
+  transcript,
+  analysisId,
+  onUpdate,
+}: {
+  transcript: string | null;
+  analysisId: string;
+  onUpdate: () => void;
+}) {
   const [copied, setCopied] = useState(false);
-  if (!transcript) return <p className="text-sm text-muted-foreground">No polished transcript available.</p>;
-
-  const lines = transcript.split("\n").filter((l) => l.trim());
+  const [editing, setEditing] = useState(false);
+  const [editValue, setEditValue] = useState(transcript ?? "");
+  const [saving, setSaving] = useState(false);
 
   function handleCopy() {
-    navigator.clipboard.writeText(transcript);
+    navigator.clipboard.writeText(transcript ?? "");
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
     toast.success("Transcript copied!");
   }
 
+  async function save() {
+    setSaving(true);
+    const { error } = await supabase.from("analyses").update({ polished_transcript: editValue }).eq("id", analysisId);
+    setSaving(false);
+    if (error) {
+      toast.error(error.message);
+    } else {
+      setEditing(false);
+      onUpdate();
+      toast.success("Saved");
+    }
+  }
+
+  if (!transcript && !editing) {
+    return <p className="text-sm text-muted-foreground">No polished transcript available.</p>;
+  }
+
+  if (editing) {
+    return (
+      <div>
+        <textarea
+          value={editValue}
+          onChange={(e) => setEditValue(e.target.value)}
+          className="w-full text-sm leading-relaxed bg-muted rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-primary/40 resize-y min-h-[400px]"
+          rows={20}
+          autoFocus
+        />
+        <div className="flex gap-2 mt-2">
+          <Button size="sm" onClick={save} disabled={saving} className="gap-1.5">
+            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+            Save
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => { setEditing(false); setEditValue(transcript ?? ""); }}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  const lines = (transcript ?? "").split("\n").filter((l) => l.trim());
+
   return (
     <div>
-      <div className="flex justify-end mb-3">
+      <div className="flex justify-end gap-2 mb-3">
+        <Button variant="ghost" size="sm" onClick={() => { setEditValue(transcript ?? ""); setEditing(true); }}>
+          <Pencil className="h-3.5 w-3.5 mr-1" />
+          Edit
+        </Button>
         <Button variant="ghost" size="sm" onClick={handleCopy}>
           {copied ? <Check className="h-3.5 w-3.5 mr-1" /> : <Copy className="h-3.5 w-3.5 mr-1" />}
           {copied ? "Copied" : "Copy"}
@@ -741,14 +879,20 @@ function AnalysisPage() {
             {activeTab === "summary" && (
               <div className="rounded-xl border border-border bg-surface/40 p-6">
                 <h2 className="font-display text-lg font-semibold mb-3">Summary</h2>
-                <p className="text-sm leading-relaxed whitespace-pre-wrap">{a.summary ?? "No summary available."}</p>
+                <EditableContent
+                  value={a.summary}
+                  analysisId={a.id}
+                  field="summary"
+                  onUpdate={fetchAnalysis}
+                  placeholder="No summary available."
+                />
               </div>
             )}
 
             {activeTab === "polished" && (
               <div className="rounded-xl border border-border bg-surface/40 p-6">
                 <h2 className="font-display text-lg font-semibold mb-4">AI Polished Transcript <span className="text-xs font-normal text-muted-foreground ml-2">(cleaned up by AI — use Raw for accuracy)</span></h2>
-                <PolishedTranscriptView transcript={a.polished_transcript} />
+                <PolishedTranscriptView transcript={a.polished_transcript} analysisId={a.id} onUpdate={fetchAnalysis} />
               </div>
             )}
 
