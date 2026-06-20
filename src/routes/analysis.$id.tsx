@@ -645,8 +645,8 @@ function AnalysisPage() {
 
   const tabs = [
     { key: "summary", label: "Summary", icon: Sparkles },
-    { key: "polished", label: "Polished", icon: FileText },
-    { key: "transcript", label: "Raw", icon: Users },
+    { key: "transcript", label: "Raw Transcript", icon: Users },
+    { key: "polished", label: "AI Polished", icon: FileText },
     { key: "notes", label: "Notes", icon: FileText },
     { key: "sentiment", label: "Sentiment", icon: Clock },
     { key: "chat", label: "AI Chat", icon: MessageSquare },
@@ -747,14 +747,14 @@ function AnalysisPage() {
 
             {activeTab === "polished" && (
               <div className="rounded-xl border border-border bg-surface/40 p-6">
-                <h2 className="font-display text-lg font-semibold mb-4">Polished Transcript</h2>
+                <h2 className="font-display text-lg font-semibold mb-4">AI Polished Transcript <span className="text-xs font-normal text-muted-foreground ml-2">(cleaned up by AI — use Raw for accuracy)</span></h2>
                 <PolishedTranscriptView transcript={a.polished_transcript} />
               </div>
             )}
 
             {activeTab === "transcript" && (
               <div className="rounded-xl border border-border bg-surface/40 p-6">
-                <h2 className="font-display text-lg font-semibold mb-4">Raw Speaker Transcript</h2>
+                <h2 className="font-display text-lg font-semibold mb-4">Raw Transcript <span className="text-xs font-normal text-muted-foreground ml-2">(as transcribed — speaker-labeled, timestamped)</span></h2>
                 {utterances.length > 0 ? (
                   <div className="space-y-3 max-h-[600px] overflow-y-auto pr-2">
                     {utterances.map((u) => (
@@ -774,9 +774,17 @@ function AnalysisPage() {
                     ))}
                   </div>
                 ) : (
-                  <p className="text-sm text-muted-foreground">
-                    No raw utterances — check the Polished tab for the formatted transcript.
-                  </p>
+                  <div>
+                    {a.raw_transcript?.raw_text ? (
+                      <pre className="text-sm leading-relaxed whitespace-pre-wrap font-sans">
+                        {a.raw_transcript.raw_text}
+                      </pre>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        No speaker utterances found. This may be a caption-only transcription — check the AI Polished tab.
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
             )}

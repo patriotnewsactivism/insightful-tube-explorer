@@ -1,6 +1,6 @@
 """
-TubeScribe: Audio Worker v8
-Pipeline: Pasted transcript → Supadata API → YouTube captions fallback
+TubeScribe: Audio Worker v13
+Pipeline: Pasted transcript → Deepgram Nova-2 (audio) → Supadata API → YouTube captions fallback
          → AI insights (parallel)
 
 v6: Supadata API integration
@@ -9,6 +9,7 @@ v8: Fact extraction, entity extraction, cross-video search, bulk support
 v8.1: Quote extraction, timeline builder, contradiction detector
 v9: Replaced Azure AI with free alternatives (Google Gemini + Groq)
 v12: Cerebras support (1M tokens/day free), optimized prompt sizes, robust rate limiting
+v13: Deepgram Nova-2 as primary transcription (real audio, not captions); fixed raw/polished labeling
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -39,6 +40,7 @@ USE_OPENROUTER   = bool(OPENROUTER_API_KEY)
 # Which provider to try first
 AI_PROVIDER      = "cerebras" if USE_CEREBRAS else ("openrouter" if USE_OPENROUTER else "groq")
 SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
+DEEPGRAM_API_KEY         = os.environ.get("DEEPGRAM_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -403,6 +405,159 @@ def parse_pasted_transcript(text):
         print(f"[worker] Parsed pasted transcript: {len(segments)} sentence segments (no timestamps)")
 
     return segments
+
+
+# ── Deepgram Nova-2 Transcription ─────────────────────────────────────────────
+def download_audio(video_id, out_path):
+    """Download best audio from YouTube using yt-dlp, convert to mp3 via ffmpeg."""
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--output", out_path,
+        "--no-warnings",
+        "--quiet",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    print(f"[worker] Downloading audio for {video_id}...")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        print(f"[worker] yt-dlp failed: {result.stderr[:300]}")
+        return False
+    if not os.path.exists(out_path):
+        # yt-dlp may append extension
+        mp3_path = out_path + ".mp3" if not out_path.endswith(".mp3") else out_path
+        if os.path.exists(mp3_path):
+            os.rename(mp3_path, out_path)
+        else:
+            # search for any file matching base
+            base = out_path.rsplit(".", 1)[0]
+            for ext in [".mp3", ".m4a", ".webm", ".opus"]:
+                candidate = base + ext
+                if os.path.exists(candidate):
+                    # convert to mp3
+                    subprocess.run(["ffmpeg", "-y", "-i", candidate, out_path],
+                                   capture_output=True, timeout=120)
+                    os.remove(candidate)
+                    break
+    if not os.path.exists(out_path):
+        print("[worker] Audio file not found after yt-dlp")
+        return False
+    size_mb = os.path.getsize(out_path) / 1024 / 1024
+    print(f"[worker] Audio downloaded: {size_mb:.1f}MB")
+    return True
+
+
+def transcribe_deepgram(audio_path):
+    """Send audio file to Deepgram Nova-2 for transcription with diarization."""
+    if not DEEPGRAM_API_KEY:
+        print("[worker] No DEEPGRAM_API_KEY set, skipping Deepgram")
+        return None
+
+    file_size = os.path.getsize(audio_path)
+    print(f"[worker] Sending {file_size/1024/1024:.1f}MB to Deepgram Nova-2...")
+
+    url = (
+        "https://api.deepgram.com/v1/listen"
+        "?model=nova-2"
+        "&smart_format=true"
+        "&diarize=true"
+        "&punctuate=true"
+        "&paragraphs=true"
+        "&utterances=true"
+        "&language=en-US"
+    )
+
+    with open(audio_path, "rb") as f:
+        audio_data = f.read()
+
+    req = Request(url, data=audio_data, headers={
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": "audio/mpeg",
+    }, method="POST")
+
+    try:
+        t0 = time.time()
+        res = urlopen(req, timeout=600)
+        result = json.loads(res.read())
+        elapsed = time.time() - t0
+        print(f"[worker] Deepgram transcription completed in {elapsed:.1f}s")
+        return result
+    except HTTPError as e:
+        body = e.read().decode()
+        print(f"[worker] Deepgram API error ({e.status}): {body[:300]}")
+        return None
+    except Exception as e:
+        print(f"[worker] Deepgram exception: {e}")
+        return None
+
+
+def parse_deepgram_result(result):
+    """Parse Deepgram response into utterances and a raw transcript string."""
+    if not result:
+        return None, None
+
+    utterances = []
+    segments = []
+
+    # Use utterances (diarized) if available
+    raw_utterances = result.get("results", {}).get("utterances", [])
+    if raw_utterances:
+        for u in raw_utterances:
+            speaker = f"Speaker {u.get('speaker', 0) + 1}"
+            text = u.get("transcript", "").strip()
+            start = float(u.get("start", 0))
+            end = float(u.get("end", start + 1))
+            if text:
+                utterances.append({"speaker": speaker, "text": text, "start": start, "end": end})
+                segments.append({"text": text, "start": start, "end": end})
+        print(f"[worker] Deepgram: {len(utterances)} diarized utterances")
+    else:
+        # Fallback: use word-level or channel transcript
+        channels = result.get("results", {}).get("channels", [])
+        if channels:
+            alts = channels[0].get("alternatives", [])
+            if alts:
+                words = alts[0].get("words", [])
+                # Group words into ~10-second segments
+                if words:
+                    chunk_words = []
+                    chunk_start = float(words[0].get("start", 0))
+                    chunk_end = chunk_start
+                    for w in words:
+                        chunk_words.append(w.get("punctuated_word", w.get("word", "")))
+                        chunk_end = float(w.get("end", chunk_end))
+                        if chunk_end - chunk_start >= 10.0 or len(chunk_words) >= 30:
+                            text = " ".join(chunk_words).strip()
+                            if text:
+                                utterances.append({"speaker": "Narrator", "text": text,
+                                                   "start": chunk_start, "end": chunk_end})
+                                segments.append({"text": text, "start": chunk_start, "end": chunk_end})
+                            chunk_words = []
+                            chunk_start = chunk_end
+                    if chunk_words:
+                        text = " ".join(chunk_words).strip()
+                        if text:
+                            utterances.append({"speaker": "Narrator", "text": text,
+                                               "start": chunk_start, "end": chunk_end})
+                            segments.append({"text": text, "start": chunk_start, "end": chunk_end})
+                    print(f"[worker] Deepgram: {len(utterances)} word-grouped segments (no diarization)")
+
+    if not utterances:
+        return None, None
+
+    # Build raw transcript text (timestamped, speaker-labeled)
+    raw_lines = []
+    for u in utterances:
+        m = int(u["start"]) // 60
+        s = int(u["start"]) % 60
+        ts = f"{m}:{s:02d}"
+        raw_lines.append(f"[{ts}] {u['speaker']}: {u['text']}")
+    raw_transcript_text = "\n".join(raw_lines)
+
+    return utterances, raw_transcript_text
 
 # ── Azure Blob helpers ───────────────────────────────────────────────────────
 def parse_conn_str(cs):
@@ -951,7 +1106,8 @@ def run_pipeline(record):
                 {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
                 for seg in segments
             ]
-            polished = "\n".join(seg["text"] for seg in segments)
+            # raw_transcript_text = joined captions; polished is set by AI below
+            raw_transcript_text = "\n".join(seg["text"] for seg in segments)
             raw_data = {"source": "pasted_transcript", "char_count": len(pasted), "segments": len(segments)}
             used_source = "pasted transcript"
 
@@ -961,82 +1117,124 @@ def run_pipeline(record):
                 fail_analysis(analysis_id, "Could not extract video ID from URL")
                 return
 
-            # ── TRACK 1: Supadata API (primary — bypasses YouTube bot detection) ──
-            set_status(analysis_id, "extracting")
-            transcript_data, video_info, src = fetch_supadata_transcript(video_id)
+            utterances = None
+            raw_transcript_text = None
+            raw_data = {}
+            used_source = None
 
-            if transcript_data:
-                set_status(analysis_id, "transcribing")
-                segments = parse_supadata_transcript(transcript_data)
-
-                # Update title/description from Supadata if not already set
-                if video_info:
-                    if not title and video_info.get("title"):
-                        title = video_info["title"]
-                        sb_patch("analyses", {"id": analysis_id}, {"title": title})
-                    if not description and video_info.get("description"):
-                        description = video_info["description"]
-
-                if segments and len(segments) > 0:
-                    print(f"[worker] Using Supadata transcript ({len(segments)} segments)")
-                    utterances = [
-                        {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
-                        for seg in segments
-                    ]
-                    polished = "\n".join(seg["text"] for seg in segments)
-                    raw_data = {"source": "supadata_api", "segments": len(segments),
-                                "video_info": video_info if video_info else {}}
-                    used_source = "Supadata API"
-                else:
-                    # Supadata returned data but we couldn't parse segments
-                    # Try treating the whole response as text
-                    if isinstance(transcript_data, str) and len(transcript_data.strip()) > 50:
-                        text = transcript_data.strip()
-                        utterances = [{"speaker": "Narrator", "text": text, "start": 0.0, "end": len(text.split()) * 0.4}]
-                        polished = text
-                        raw_data = {"source": "supadata_api_text", "char_count": len(text)}
-                        used_source = "Supadata API (plain text)"
+            # ── TRACK 1: Deepgram Nova-2 (real audio transcription — most accurate) ──
+            if DEEPGRAM_API_KEY:
+                set_status(analysis_id, "extracting")
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    audio_path = os.path.join(tmpdir, "audio.mp3")
+                    if download_audio(video_id, audio_path):
+                        set_status(analysis_id, "transcribing")
+                        dg_result = transcribe_deepgram(audio_path)
+                        dg_utterances, dg_raw_text = parse_deepgram_result(dg_result)
+                        if dg_utterances and dg_raw_text:
+                            utterances = dg_utterances
+                            raw_transcript_text = dg_raw_text
+                            raw_data = {
+                                "source": "deepgram_nova2",
+                                "segments": len(dg_utterances),
+                                "diarized": any(u["speaker"] != "Narrator" for u in dg_utterances),
+                            }
+                            used_source = "Deepgram Nova-2"
+                            print(f"[worker] Deepgram track complete: {len(utterances)} utterances")
+                        else:
+                            print("[worker] Deepgram returned no results, falling back")
                     else:
-                        transcript_data = None  # Fall through to next track
+                        print("[worker] Audio download failed, falling back to captions")
 
-            if not transcript_data or (not segments if 'segments' in dir() else True):
-                # ── TRACK 2: YouTube transcript (direct scrape, may be blocked) ──
+            # ── TRACK 2: Supadata API (caption-based fallback) ──
+            if utterances is None:
+                set_status(analysis_id, "extracting")
+                transcript_data, video_info, src = fetch_supadata_transcript(video_id)
+
+                if transcript_data:
+                    set_status(analysis_id, "transcribing")
+                    segments = parse_supadata_transcript(transcript_data)
+
+                    # Update title/description from Supadata if not already set
+                    if video_info:
+                        if not title and video_info.get("title"):
+                            title = video_info["title"]
+                            sb_patch("analyses", {"id": analysis_id}, {"title": title})
+                        if not description and video_info.get("description"):
+                            description = video_info["description"]
+
+                    if segments and len(segments) > 0:
+                        print(f"[worker] Using Supadata transcript ({len(segments)} segments)")
+                        utterances = [
+                            {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
+                            for seg in segments
+                        ]
+                        raw_transcript_text = "\n".join(seg["text"] for seg in segments)
+                        raw_data = {"source": "supadata_api", "segments": len(segments),
+                                    "video_info": video_info if video_info else {}}
+                        used_source = "Supadata API"
+                    else:
+                        if isinstance(transcript_data, str) and len(transcript_data.strip()) > 50:
+                            text = transcript_data.strip()
+                            utterances = [{"speaker": "Narrator", "text": text, "start": 0.0, "end": len(text.split()) * 0.4}]
+                            raw_transcript_text = text
+                            raw_data = {"source": "supadata_api_text", "char_count": len(text)}
+                            used_source = "Supadata API (plain text)"
+
+            # ── TRACK 3: YouTube captions (direct scrape) ──
+            if utterances is None:
                 yt_transcript = fetch_youtube_transcript(video_id) if video_id else None
 
                 if yt_transcript and len(yt_transcript) > 5:
-                    print(f"[worker] Using YouTube transcript ({len(yt_transcript)} segments)")
+                    print(f"[worker] Using YouTube captions ({len(yt_transcript)} segments)")
                     set_status(analysis_id, "transcribing")
                     utterances = [
                         {"speaker": "Narrator", "text": seg["text"], "start": seg["start"], "end": seg["end"]}
                         for seg in yt_transcript
                     ]
-                    polished = "\n".join(seg["text"] for seg in yt_transcript)
-                    raw_data = {"source": "youtube_captions", "segments": yt_transcript}
+                    raw_transcript_text = "\n".join(seg["text"] for seg in yt_transcript)
+                    raw_data = {"source": "youtube_captions", "segments": len(yt_transcript)}
                     used_source = "YouTube captions"
+
+            # ── TRACK 4: Fail ──
+            if utterances is None:
+                if SUPADATA_API_KEY or DEEPGRAM_API_KEY:
+                    fail_analysis(analysis_id,
+                        "Could not extract transcript. Audio download may have failed and "
+                        "no captions are available. Try the 'Paste transcript' option.")
                 else:
-                    # ── TRACK 3: Fail with helpful message ──
-                    if SUPADATA_API_KEY:
-                        fail_analysis(analysis_id,
-                            "Could not extract transcript. The Supadata API may be out of credits, "
-                            "or this video has no available captions. Try the 'Paste transcript' option.")
-                    else:
-                        fail_analysis(analysis_id,
-                            "YouTube blocks server access for transcript extraction. "
-                            "Please use the 'Paste transcript manually' option on the dashboard.")
-                    return
+                    fail_analysis(analysis_id,
+                        "YouTube blocks server access for transcript extraction. "
+                        "Please use the 'Paste transcript manually' option on the dashboard.")
+                return
 
         # ── AI Insights ──
         set_status(analysis_id, "processing")
-        insights = generate_insights(polished, title, description, user_id=user_id)
+        # Pass raw_transcript_text to AI for polishing/analysis
+        insights = generate_insights(raw_transcript_text, title, description, user_id=user_id)
 
         # Extract non-column fields before saving
         speakers_info = insights.pop("speakers_info", [])
         ai_model_info = insights.pop("ai_model_info", {})
 
+        # If Deepgram was used and provided real speaker diarization, prefer those speakers
+        # over the LLM-guessed ones (LLM speakers_info still useful for names/roles)
+        if raw_data.get("source") == "deepgram_nova2" and raw_data.get("diarized"):
+            dg_speakers = list({u["speaker"] for u in utterances if u["speaker"] != "Narrator"})
+            if dg_speakers and not speakers_info:
+                speakers_info = [{"label": sp, "likely_name": sp} for sp in dg_speakers]
+
         # ── Save ──
+        # polished_transcript = AI-polished version (readable prose)
+        # raw_transcript field (JSONB) = source metadata + raw caption/audio text
         sb_patch("analyses", {"id": analysis_id}, {
             "status": "complete",
-            "raw_transcript": {**raw_data, "speakers_info": speakers_info, "ai_model_info": ai_model_info},
+            "raw_transcript": {
+                **raw_data,
+                "raw_text": raw_transcript_text,
+                "speakers_info": speakers_info,
+                "ai_model_info": ai_model_info,
+            },
             **insights,
         })
 
