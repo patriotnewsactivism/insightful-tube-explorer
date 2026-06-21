@@ -16,15 +16,20 @@ export type Database = {
     Tables: {
       analyses: {
         Row: {
+          capture_metadata: Json | null
+          captured_at: string | null
           channel: string | null
           created_at: string
           description: string | null
           error_message: string | null
+          evidence_hash: string | null
           expanded_notes: string | null
           id: string
           likely_production_date: string | null
           pasted_transcript: string | null
           polished_transcript: string | null
+          preserved_raw_hash: string | null
+          preserved_raw_transcript: string | null
           production_date_reasoning: string | null
           published_at: string | null
           raw_transcript: Json | null
@@ -39,15 +44,20 @@ export type Database = {
           youtube_url: string
         }
         Insert: {
+          capture_metadata?: Json | null
+          captured_at?: string | null
           channel?: string | null
           created_at?: string
           description?: string | null
           error_message?: string | null
+          evidence_hash?: string | null
           expanded_notes?: string | null
           id?: string
           likely_production_date?: string | null
           pasted_transcript?: string | null
           polished_transcript?: string | null
+          preserved_raw_hash?: string | null
+          preserved_raw_transcript?: string | null
           production_date_reasoning?: string | null
           published_at?: string | null
           raw_transcript?: Json | null
@@ -62,15 +72,20 @@ export type Database = {
           youtube_url: string
         }
         Update: {
+          capture_metadata?: Json | null
+          captured_at?: string | null
           channel?: string | null
           created_at?: string
           description?: string | null
           error_message?: string | null
+          evidence_hash?: string | null
           expanded_notes?: string | null
           id?: string
           likely_production_date?: string | null
           pasted_transcript?: string | null
           polished_transcript?: string | null
+          preserved_raw_hash?: string | null
+          preserved_raw_transcript?: string | null
           production_date_reasoning?: string | null
           published_at?: string | null
           raw_transcript?: Json | null
@@ -83,6 +98,36 @@ export type Database = {
           user_id?: string
           youtube_id?: string | null
           youtube_url?: string
+        }
+        Relationships: []
+      }
+      custody_log: {
+        Row: {
+          id: string
+          analysis_id: string
+          user_id: string | null
+          action: string
+          details: Json
+          actor: string
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          analysis_id: string
+          user_id?: string | null
+          action: string
+          details?: Json
+          actor?: string
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          analysis_id?: string
+          user_id?: string | null
+          action?: string
+          details?: Json
+          actor?: string
+          created_at?: string
         }
         Relationships: []
       }
