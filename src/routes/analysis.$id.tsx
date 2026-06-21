@@ -5,13 +5,14 @@ import { useAuth } from "@/hooks/useAuth";
 import { SiteHeader } from "@/components/SiteHeader";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { CustodyTimeline } from "@/components/CustodyTimeline";
+import { CaseBuddyExportButton } from "@/components/CaseBuddyExport";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
   Loader2, ArrowLeft, AlertCircle, Clock, Users, FileText,
   Sparkles, Calendar, Download, MessageSquare, Send, User,
   ChevronDown, ChevronUp, Copy, Check, Mic, MicOff, RefreshCw, Pencil,
-  Shield
+  Shield, Scale
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -849,7 +850,10 @@ function AnalysisPage() {
             <Link to="/dashboard"><ArrowLeft className="h-4 w-4 mr-1" /> Library</Link>
           </Button>
           {a.status === "complete" && (
-            <ExportButton analysisId={a.id} title={a.title ?? "export"} />
+            <div className="flex items-center gap-2">
+              <CaseBuddyExportButton analysisId={a.id} title={a.title ?? "export"} />
+              <ExportButton analysisId={a.id} title={a.title ?? "export"} />
+            </div>
           )}
         </div>
 
@@ -1074,8 +1078,9 @@ function AnalysisPage() {
                   <CustodyTimeline analysisId={a.id} />
                 </div>
 
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
                   <ForensicExportButton analysisId={a.id} title={a.title ?? "export"} />
+                  <CaseBuddyExportButton analysisId={a.id} title={a.title ?? "export"} />
                 </div>
               </div>
             )}

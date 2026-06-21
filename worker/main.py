@@ -12,6 +12,7 @@ v12: Cerebras support (1M tokens/day free), optimized prompt sizes, robust rate 
 v13: Deepgram Nova-2 as primary transcription (real audio, not captions); fixed raw/polished labeling
 v14: Forensic evidence foundation — SHA-256 hash chain, chain of custody log, raw transcript
      preservation, forensic export, hash verification endpoint
+v15: CaseBuddy integration bridge + MCP server (7 tools for AI agent consumption)
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -92,7 +93,7 @@ def sb_insert(table, rows):
     except HTTPError as e:
         print(f"[sb_insert] {e.status}: {e.read()}")
 
-WORKER_VERSION = "v14"
+WORKER_VERSION = "v15"
 
 # ── Forensic Evidence Helpers ────────────────────────────────────────────────
 
@@ -340,6 +341,343 @@ def handle_custody_log(data):
     if not analysis_id:
         return {"error": "analysis_id required"}
     return {"chain": get_custody_chain(analysis_id)}
+
+
+# ── CaseBuddy Integration Bridge ────────────────────────────────────────────
+def handle_casebuddy_export(data):
+    """Package an analysis as a CaseBuddy-compatible evidence object.
+    
+    Returns a JSON payload matching CaseBuddy's Evidence + Case integration format:
+    - evidence: Evidence object (id, name, type, description, dateObtained, etc.)
+    - forensic: integrity data (hash, captured_at, chain of custody)
+    - transcript: polished + raw transcripts
+    - insights: summary, sentiment, quotes, timeline, contradictions, facts, entities
+    - metadata: source URL, channel, speakers
+    """
+    analysis_id = data.get("analysis_id")
+    if not analysis_id:
+        return {"error": "analysis_id required"}
+
+    headers = {"apikey": os.environ["SUPABASE_KEY"],
+               "Authorization": f"Bearer {os.environ['SUPABASE_KEY']}",
+               "Content-Type": "application/json"}
+    base = os.environ["SUPABASE_URL"]
+
+    # Fetch the analysis
+    url = f"{base}/rest/v1/analyses?id=eq.{analysis_id}&select=*"
+    req = Request(url, headers=headers)
+    resp = json.loads(urlopen(req).read())
+    if not resp:
+        return {"error": "Analysis not found"}
+    a = resp[0]
+
+    # Fetch enrichment tables
+    enrichments = {}
+    for table in ["facts", "entities", "quotes", "timeline_events", "contradictions", "chapters"]:
+        try:
+            turl = f"{base}/rest/v1/{table}?analysis_id=eq.{analysis_id}&select=*"
+            treq = Request(turl, headers=headers)
+            enrichments[table] = json.loads(urlopen(treq).read())
+        except Exception:
+            enrichments[table] = []
+
+    # Fetch speakers
+    try:
+        surl = f"{base}/rest/v1/speakers?analysis_id=eq.{analysis_id}&select=*"
+        sreq = Request(surl, headers=headers)
+        speakers = json.loads(urlopen(sreq).read())
+    except Exception:
+        speakers = []
+
+    # Build CaseBuddy Evidence object
+    evidence = {
+        "id": f"tubescribe-{analysis_id}",
+        "name": a.get("title") or "YouTube Video Transcript",
+        "type": "Digital Video Transcript",
+        "description": (a.get("summary") or "")[:500],
+        "dateObtained": a.get("captured_at") or a.get("created_at") or datetime.now(timezone.utc).isoformat(),
+        "exhibitNumber": "",  # To be assigned by CaseBuddy user
+        "source": f"YouTube: {a.get('youtube_url', '')}",
+        "status": "verified" if a.get("evidence_hash") else "unverified",
+        "tags": ["tubescribe", "video-transcript", "digital-evidence"],
+        "notes": f"Extracted via TubeScribe. Channel: {a.get('channel', 'Unknown')}."
+    }
+
+    # Build forensic data
+    forensic = {
+        "evidence_hash": a.get("evidence_hash"),
+        "hash_algorithm": "SHA-256",
+        "captured_at": a.get("captured_at"),
+        "capture_metadata": a.get("capture_metadata"),
+        "preserved_raw_hash": a.get("preserved_raw_hash"),
+        "chain_of_custody": get_custody_chain(analysis_id),
+        "integrity_status": "verified" if a.get("evidence_hash") else "pre-forensic"
+    }
+
+    # Build transcript pair
+    transcript = {
+        "raw": a.get("preserved_raw_transcript") or a.get("raw_transcript"),
+        "polished": a.get("polished_transcript"),
+    }
+
+    # Build insights bundle
+    sentiment = a.get("sentiment")
+    if isinstance(sentiment, str):
+        try: sentiment = json.loads(sentiment)
+        except Exception: pass
+
+    insights = {
+        "summary": a.get("summary"),
+        "expanded_notes": a.get("expanded_notes"),
+        "sentiment": sentiment,
+        "likely_production_date": a.get("likely_production_date"),
+        "production_date_reasoning": a.get("production_date_reasoning"),
+        "quotes": [{"text": q.get("quote_text"), "speaker": q.get("speaker"), "context": q.get("context"), "significance": q.get("significance")} for q in enrichments.get("quotes", [])],
+        "timeline": [{"date": t.get("event_date"), "title": t.get("title"), "description": t.get("description"), "event_type": t.get("event_type")} for t in enrichments.get("timeline_events", [])],
+        "contradictions": [{"statement_a": c.get("statement_a"), "statement_b": c.get("statement_b"), "explanation": c.get("explanation"), "severity": c.get("severity")} for c in enrichments.get("contradictions", [])],
+        "facts": [{"fact": f.get("fact_text"), "category": f.get("category"), "confidence": f.get("confidence")} for f in enrichments.get("facts", [])],
+        "entities": [{"name": e.get("entity_name"), "type": e.get("entity_type"), "context": e.get("context")} for e in enrichments.get("entities", [])],
+        "chapters": [{"title": ch.get("title"), "summary": ch.get("summary"), "start_time": ch.get("start_seconds")} for ch in enrichments.get("chapters", [])],
+    }
+
+    # Build metadata
+    metadata = {
+        "source_url": a.get("youtube_url"),
+        "youtube_id": a.get("youtube_id"),
+        "channel": a.get("channel"),
+        "thumbnail_url": a.get("thumbnail_url"),
+        "speakers": [{"label": s.get("label"), "display_name": s.get("display_name")} for s in speakers],
+        "tubescribe_analysis_id": analysis_id,
+        "worker_version": WORKER_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    log_custody(analysis_id, "casebuddy_exported", {
+        "format": "casebuddy_evidence_bundle",
+    }, user_id=data.get("user_id"))
+
+    return {
+        "evidence": evidence,
+        "forensic": forensic,
+        "transcript": transcript,
+        "insights": insights,
+        "metadata": metadata,
+    }
+
+
+# ── MCP Server ──────────────────────────────────────────────────────────────
+MCP_TOOLS = [
+    {
+        "name": "transcribe_video",
+        "description": "Submit a YouTube video URL for transcription and AI analysis. Returns the analysis ID for tracking.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "youtube_url": {"type": "string", "description": "YouTube video URL to transcribe"},
+                "user_id": {"type": "string", "description": "Supabase user ID (optional)"},
+            },
+            "required": ["youtube_url"],
+        },
+    },
+    {
+        "name": "search_transcripts",
+        "description": "Search across all transcribed videos for a text query. Returns matching analyses with snippets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query text"},
+                "user_id": {"type": "string", "description": "Filter to a specific user's analyses"},
+                "limit": {"type": "integer", "description": "Max results (default 10)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_analysis",
+        "description": "Get full analysis details by ID including summary, transcript, sentiment, and metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "analysis_id": {"type": "string", "description": "Analysis UUID"},
+            },
+            "required": ["analysis_id"],
+        },
+    },
+    {
+        "name": "get_quotes",
+        "description": "Get notable quotes extracted from a video analysis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "analysis_id": {"type": "string", "description": "Analysis UUID"},
+            },
+            "required": ["analysis_id"],
+        },
+    },
+    {
+        "name": "get_timeline",
+        "description": "Get timeline events extracted from a video analysis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "analysis_id": {"type": "string", "description": "Analysis UUID"},
+            },
+            "required": ["analysis_id"],
+        },
+    },
+    {
+        "name": "get_contradictions",
+        "description": "Get contradictions found within a video analysis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "analysis_id": {"type": "string", "description": "Analysis UUID"},
+            },
+            "required": ["analysis_id"],
+        },
+    },
+    {
+        "name": "verify_evidence",
+        "description": "Verify the forensic integrity of an analysis by re-computing its SHA-256 hash.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "analysis_id": {"type": "string", "description": "Analysis UUID"},
+            },
+            "required": ["analysis_id"],
+        },
+    },
+]
+
+
+def handle_mcp(data):
+    """Handle MCP JSON-RPC 2.0 requests.
+    
+    Supports:
+    - initialize: capability negotiation
+    - tools/list: list available tools
+    - tools/call: execute a tool
+    """
+    jsonrpc = data.get("jsonrpc", "2.0")
+    method = data.get("method", "")
+    params = data.get("params", {})
+    req_id = data.get("id")
+
+    def rpc_result(result):
+        return {"jsonrpc": jsonrpc, "id": req_id, "result": result}
+
+    def rpc_error(code, message):
+        return {"jsonrpc": jsonrpc, "id": req_id, "error": {"code": code, "message": message}}
+
+    # ── initialize ──
+    if method == "initialize":
+        return rpc_result({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {
+                "name": "tubescribe-mcp",
+                "version": WORKER_VERSION,
+            },
+        })
+
+    # ── tools/list ──
+    if method == "tools/list":
+        return rpc_result({"tools": MCP_TOOLS})
+
+    # ── tools/call ──
+    if method == "tools/call":
+        tool_name = params.get("name", "")
+        arguments = params.get("arguments", {})
+        return _mcp_call_tool(tool_name, arguments, rpc_result, rpc_error)
+
+    return rpc_error(-32601, f"Method not found: {method}")
+
+
+def _mcp_call_tool(tool_name, arguments, rpc_result, rpc_error):
+    """Dispatch an MCP tool call and return the result."""
+    headers = {"apikey": os.environ["SUPABASE_KEY"],
+               "Authorization": f"Bearer {os.environ['SUPABASE_KEY']}",
+               "Content-Type": "application/json"}
+    base = os.environ["SUPABASE_URL"]
+
+    try:
+        if tool_name == "transcribe_video":
+            youtube_url = arguments.get("youtube_url", "")
+            user_id = arguments.get("user_id")
+            video_id = extract_video_id(youtube_url)
+            if not video_id:
+                return rpc_result({"content": [{"type": "text", "text": f"Invalid YouTube URL: {youtube_url}"}], "isError": True})
+            
+            # Insert a new analysis record
+            insert_data = {
+                "youtube_url": youtube_url,
+                "youtube_id": video_id,
+                "status": "pending",
+                "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+            }
+            if user_id:
+                insert_data["user_id"] = user_id
+            
+            req = Request(f"{base}/rest/v1/analyses", 
+                         data=json.dumps(insert_data).encode(),
+                         headers={**headers, "Prefer": "return=representation"}, method="POST")
+            resp = json.loads(urlopen(req).read())
+            new_id = resp[0]["id"] if isinstance(resp, list) else resp["id"]
+            
+            # Trigger the pipeline
+            import threading
+            threading.Thread(target=run_pipeline, args=(resp[0] if isinstance(resp, list) else resp,), daemon=True).start()
+            
+            return rpc_result({"content": [{"type": "text", "text": json.dumps({
+                "analysis_id": new_id,
+                "youtube_id": video_id,
+                "status": "pending",
+                "message": "Transcription pipeline started. Poll get_analysis to check status."
+            })}]})
+
+        elif tool_name == "search_transcripts":
+            result = handle_search(arguments)
+            return rpc_result({"content": [{"type": "text", "text": json.dumps(result)}]})
+
+        elif tool_name == "get_analysis":
+            analysis_id = arguments.get("analysis_id", "")
+            url = f"{base}/rest/v1/analyses?id=eq.{analysis_id}&select=id,youtube_url,youtube_id,title,channel,status,summary,polished_transcript,expanded_notes,sentiment,likely_production_date,evidence_hash,captured_at,created_at"
+            req = Request(url, headers=headers)
+            resp = json.loads(urlopen(req).read())
+            if not resp:
+                return rpc_result({"content": [{"type": "text", "text": "Analysis not found"}], "isError": True})
+            return rpc_result({"content": [{"type": "text", "text": json.dumps(resp[0])}]})
+
+        elif tool_name == "get_quotes":
+            analysis_id = arguments.get("analysis_id", "")
+            url = f"{base}/rest/v1/quotes?analysis_id=eq.{analysis_id}&select=*"
+            req = Request(url, headers=headers)
+            resp = json.loads(urlopen(req).read())
+            return rpc_result({"content": [{"type": "text", "text": json.dumps(resp)}]})
+
+        elif tool_name == "get_timeline":
+            analysis_id = arguments.get("analysis_id", "")
+            url = f"{base}/rest/v1/timeline_events?analysis_id=eq.{analysis_id}&select=*&order=event_date"
+            req = Request(url, headers=headers)
+            resp = json.loads(urlopen(req).read())
+            return rpc_result({"content": [{"type": "text", "text": json.dumps(resp)}]})
+
+        elif tool_name == "get_contradictions":
+            analysis_id = arguments.get("analysis_id", "")
+            url = f"{base}/rest/v1/contradictions?analysis_id=eq.{analysis_id}&select=*"
+            req = Request(url, headers=headers)
+            resp = json.loads(urlopen(req).read())
+            return rpc_result({"content": [{"type": "text", "text": json.dumps(resp)}]})
+
+        elif tool_name == "verify_evidence":
+            result = handle_verify_hash(arguments)
+            return rpc_result({"content": [{"type": "text", "text": json.dumps(result)}]})
+
+        else:
+            return rpc_error(-32602, f"Unknown tool: {tool_name}")
+
+    except Exception as e:
+        return rpc_error(-32603, f"Tool execution error: {str(e)[:500]}")
 
 
 # ── YouTube helpers ──────────────────────────────────────────────────────────
@@ -2128,6 +2466,22 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(results, indent=2).encode())
             return
+        # ── MCP capabilities (GET) ──
+        if path == "/mcp":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "name": "tubescribe-mcp",
+                "version": WORKER_VERSION,
+                "protocol": "MCP JSON-RPC 2.0",
+                "description": "TubeScribe MCP server — transcribe YouTube videos, search transcripts, extract quotes/timeline/contradictions, verify forensic evidence integrity",
+                "tools": MCP_TOOLS,
+                "usage": "POST /mcp with JSON-RPC 2.0 body. Methods: initialize, tools/list, tools/call",
+            }, indent=2).encode())
+            return
+
         supadata = "yes" if SUPADATA_API_KEY else "no"
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -2148,7 +2502,7 @@ class Handler(BaseHTTPRequestHandler):
             fallbacks.append(f"groq ({GROQ_MODEL})")
         ai_fallback = " → ".join(fallbacks) if fallbacks else "none"
         self.wfile.write(json.dumps({
-            "status": "ok", "version": WORKER_VERSION, "supadata": supadata, "forensic": True,
+            "status": "ok", "version": WORKER_VERSION, "supadata": supadata, "forensic": True, "mcp": True, "casebuddy_bridge": True,
             "ai_provider": AI_PROVIDER,
             "ai_primary": ai_primary,
             "ai_fallback": ai_fallback,
@@ -2237,6 +2591,26 @@ class Handler(BaseHTTPRequestHandler):
         # ── Custody log endpoint ──
         if path == "/custody-log":
             result = handle_custody_log(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── CaseBuddy export endpoint ──
+        if path == "/casebuddy-export":
+            result = handle_casebuddy_export(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── MCP server endpoint ──
+        if path == "/mcp":
+            result = handle_mcp(payload)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._cors_headers()
