@@ -3,12 +3,15 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 import { SiteHeader } from "@/components/SiteHeader";
+import { EvidenceBadge } from "@/components/EvidenceBadge";
+import { CustodyTimeline } from "@/components/CustodyTimeline";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
   Loader2, ArrowLeft, AlertCircle, Clock, Users, FileText,
   Sparkles, Calendar, Download, MessageSquare, Send, User,
-  ChevronDown, ChevronUp, Copy, Check, Mic, MicOff, RefreshCw, Pencil
+  ChevronDown, ChevronUp, Copy, Check, Mic, MicOff, RefreshCw, Pencil,
+  Shield
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -34,6 +37,9 @@ type Analysis = {
   sentiment: any;
   error_message: string | null;
   raw_transcript: any;
+  evidence_hash: string | null;
+  captured_at: string | null;
+  capture_metadata: any;
 };
 
 type Utterance = {
@@ -722,6 +728,49 @@ function ExportButton({ analysisId, title }: { analysisId: string; title: string
   );
 }
 
+// ── Forensic Export ───────────────────────────────────────────────────────────
+function ForensicExportButton({ analysisId, title }: { analysisId: string; title: string }) {
+  const [exporting, setExporting] = useState(false);
+
+  async function handleForensicExport() {
+    setExporting(true);
+    try {
+      const res = await fetch(`${WORKER_URL}/export-forensic`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ analysis_id: analysisId }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        toast.error(data.error);
+        return;
+      }
+      const blob = new Blob([data.text], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const safeName = (data.title || title || "forensic").replace(/[^a-z0-9]/gi, "_").slice(0, 60);
+      a.download = `Forensic_Evidence_${safeName}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast.success("Forensic evidence package downloaded!");
+    } catch (err: any) {
+      toast.error(err.message);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  return (
+    <Button variant="outline" size="sm" onClick={handleForensicExport} disabled={exporting}>
+      {exporting ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Shield className="h-3.5 w-3.5 mr-1" />}
+      Court-Ready Export
+    </Button>
+  );
+}
+
 // ── Main Page ────────────────────────────────────────────────────────────────
 function AnalysisPage() {
   const { id } = Route.useParams();
@@ -788,6 +837,7 @@ function AnalysisPage() {
     { key: "notes", label: "Notes", icon: FileText },
     { key: "sentiment", label: "Sentiment", icon: Clock },
     { key: "chat", label: "AI Chat", icon: MessageSquare },
+    { key: "forensic", label: "Chain of Custody", icon: Shield },
   ];
 
   return (
@@ -810,7 +860,14 @@ function AnalysisPage() {
             </h1>
             {a.channel && <p className="mt-2 text-muted-foreground">{a.channel}</p>}
           </div>
-          <StatusBadge status={a.status} />
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <EvidenceBadge
+              analysisId={a.id}
+              evidenceHash={a.evidence_hash}
+              capturedAt={a.captured_at}
+            />
+            <StatusBadge status={a.status} />
+          </div>
         </div>
 
         {a.youtube_id && (
@@ -985,6 +1042,42 @@ function AnalysisPage() {
 
             {activeTab === "chat" && (
               <AIChatPanel analysisId={a.id} onUpdate={fetchAnalysis} />
+            )}
+            {activeTab === "forensic" && (
+              <div className="rounded-lg border p-6 space-y-6">
+                <div>
+                  <h3 className="font-semibold text-lg mb-1">Evidence Integrity</h3>
+                  <div className="flex items-center gap-3">
+                    <EvidenceBadge
+                      analysisId={a.id}
+                      evidenceHash={a.evidence_hash}
+                      capturedAt={a.captured_at}
+                    />
+                    {a.evidence_hash && (
+                      <span className="text-xs font-mono text-muted-foreground">
+                        SHA-256: {a.evidence_hash.slice(0, 24)}…
+                      </span>
+                    )}
+                  </div>
+                  {a.captured_at && (
+                    <p className="text-sm text-muted-foreground mt-2">
+                      Captured: {new Date(a.captured_at).toLocaleString()}
+                      {a.capture_metadata?.source && (
+                        <> via <span className="font-medium">{a.capture_metadata.source}</span></>
+                      )}
+                    </p>
+                  )}
+                </div>
+
+                <div>
+                  <h3 className="font-semibold text-lg mb-3">Chain of Custody</h3>
+                  <CustodyTimeline analysisId={a.id} />
+                </div>
+
+                <div className="flex gap-2">
+                  <ForensicExportButton analysisId={a.id} title={a.title ?? "export"} />
+                </div>
+              </div>
             )}
           </>
         )}

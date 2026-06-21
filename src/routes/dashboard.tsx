@@ -10,7 +10,7 @@ import { toast } from "sonner";
 import {
   Plus, Loader2, Play, ClipboardPaste, ChevronDown, ChevronUp,
   Zap, List, Search, BookOpen, Users, Filter, CheckCircle2, XCircle, Clock,
-  Calendar, Quote, AlertTriangle, BookMarked
+  Calendar, Quote, AlertTriangle, BookMarked, Shield
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 
@@ -27,6 +27,8 @@ type Analysis = {
   status: string;
   created_at: string;
   likely_production_date: string | null;
+  evidence_hash: string | null;
+  captured_at: string | null;
 };
 
 function Dashboard() {
@@ -54,7 +56,7 @@ function Dashboard() {
     (async () => {
       const { data, error } = await supabase
         .from("analyses")
-        .select("id, youtube_url, title, channel, thumbnail_url, status, created_at, likely_production_date")
+        .select("id, youtube_url, title, channel, thumbnail_url, status, created_at, likely_production_date, evidence_hash, captured_at")
         .order("created_at", { ascending: false });
       if (error) toast.error(error.message);
       else setAnalyses(data as Analysis[]);
@@ -441,9 +443,14 @@ function Dashboard() {
                     <p className="text-xs text-muted-foreground">
                       {a.channel} · {formatDistanceToNow(new Date(a.created_at), { addSuffix: true })}
                     </p>
-                    {a.likely_production_date && (
-                      <span className="text-xs text-muted-foreground/60">{a.likely_production_date}</span>
-                    )}
+                    <div className="flex items-center gap-1">
+                      {a.likely_production_date && (
+                        <span className="text-xs text-muted-foreground/60">{a.likely_production_date}</span>
+                      )}
+                      {a.evidence_hash && (
+                        <Shield className="h-3 w-3 text-emerald-500 flex-shrink-0" title="Forensic evidence preserved" />
+                      )}
+                    </div>
                   </div>
                 </div>
               </Link>

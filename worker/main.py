@@ -1,5 +1,5 @@
 """
-TubeScribe: Audio Worker v13
+TubeScribe: Audio Worker v14
 Pipeline: Pasted transcript → Deepgram Nova-2 (audio) → Supadata API → YouTube captions fallback
          → AI insights (parallel)
 
@@ -10,6 +10,8 @@ v8.1: Quote extraction, timeline builder, contradiction detector
 v9: Replaced Azure AI with free alternatives (Google Gemini + Groq)
 v12: Cerebras support (1M tokens/day free), optimized prompt sizes, robust rate limiting
 v13: Deepgram Nova-2 as primary transcription (real audio, not captions); fixed raw/polished labeling
+v14: Forensic evidence foundation — SHA-256 hash chain, chain of custody log, raw transcript
+     preservation, forensic export, hash verification endpoint
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
@@ -89,6 +91,256 @@ def sb_insert(table, rows):
         urlopen(req)
     except HTTPError as e:
         print(f"[sb_insert] {e.status}: {e.read()}")
+
+WORKER_VERSION = "v14"
+
+# ── Forensic Evidence Helpers ────────────────────────────────────────────────
+
+def compute_evidence_hash(raw_text, video_id, captured_at_iso):
+    """Compute SHA-256 hash of raw transcript + video ID + capture timestamp.
+
+    This creates a tamper-evident fingerprint: if any byte of the original
+    transcript changes, the hash will no longer match.
+    """
+    payload = f"{video_id or 'no-video-id'}|{captured_at_iso}|{raw_text}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def log_custody(analysis_id, action, details=None, user_id=None, actor=None):
+    """Append an immutable entry to the chain of custody log.
+
+    Actions: created, transcript_captured, ai_processed, enrichment_complete,
+             exported, forensic_exported, hash_verified, edited, reprocessed
+    """
+    if actor is None:
+        actor = f"worker_{WORKER_VERSION}"
+    entry = {
+        "analysis_id": analysis_id,
+        "action": action,
+        "details": details or {},
+        "actor": actor,
+    }
+    if user_id:
+        entry["user_id"] = user_id
+    sb_insert("custody_log", [entry])
+
+
+def preserve_raw_transcript(analysis_id, raw_text, video_id, source, user_id=None):
+    """Freeze the byte-exact raw transcript and compute forensic hashes.
+
+    Called once, immediately after transcript extraction, before any AI processing.
+    Returns (evidence_hash, captured_at) for downstream use.
+    """
+    captured_at = datetime.now(timezone.utc).isoformat()
+    evidence_hash = compute_evidence_hash(raw_text, video_id, captured_at)
+    raw_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+
+    capture_metadata = {
+        "source": source,
+        "video_id": video_id,
+        "captured_at": captured_at,
+        "worker_version": WORKER_VERSION,
+        "hash_algorithm": "sha-256",
+        "raw_char_count": len(raw_text),
+        "raw_word_count": len(raw_text.split()),
+    }
+
+    sb_patch("analyses", {"id": analysis_id}, {
+        "evidence_hash": evidence_hash,
+        "captured_at": captured_at,
+        "capture_metadata": capture_metadata,
+        "preserved_raw_transcript": raw_text,
+        "preserved_raw_hash": raw_hash,
+    })
+
+    log_custody(analysis_id, "transcript_captured", {
+        "source": source,
+        "evidence_hash": evidence_hash,
+        "raw_hash": raw_hash,
+        "char_count": len(raw_text),
+        "word_count": len(raw_text.split()),
+    }, user_id=user_id)
+
+    print(f"[forensic] Evidence preserved for {analysis_id}: hash={evidence_hash[:16]}… source={source}")
+    return evidence_hash, captured_at
+
+
+def verify_evidence_hash(analysis_id):
+    """Re-compute and compare the evidence hash. Returns verification result dict."""
+    rows = sb_get("analyses", {"id": analysis_id},
+                  "preserved_raw_transcript,preserved_raw_hash,evidence_hash,captured_at,capture_metadata")
+    if not rows:
+        return {"verified": False, "error": "Analysis not found"}
+    a = rows[0]
+
+    if not a.get("preserved_raw_transcript") or not a.get("evidence_hash"):
+        return {"verified": False, "error": "No forensic data — analysis predates forensic system"}
+
+    video_id = (a.get("capture_metadata") or {}).get("video_id", "no-video-id")
+
+    # Verify the evidence hash (transcript + video_id + timestamp)
+    recomputed_evidence = compute_evidence_hash(
+        a["preserved_raw_transcript"], video_id, a["captured_at"]
+    )
+    evidence_match = recomputed_evidence == a["evidence_hash"]
+
+    # Verify the raw transcript hash independently
+    recomputed_raw = hashlib.sha256(a["preserved_raw_transcript"].encode("utf-8")).hexdigest()
+    raw_match = recomputed_raw == a.get("preserved_raw_hash", "")
+
+    verified = evidence_match and raw_match
+
+    log_custody(analysis_id, "hash_verified", {
+        "evidence_match": evidence_match,
+        "raw_match": raw_match,
+        "verified": verified,
+    })
+
+    return {
+        "verified": verified,
+        "evidence_hash": {"original": a["evidence_hash"], "recomputed": recomputed_evidence, "match": evidence_match},
+        "raw_hash": {"original": a.get("preserved_raw_hash"), "recomputed": recomputed_raw, "match": raw_match},
+        "captured_at": a.get("captured_at"),
+        "capture_metadata": a.get("capture_metadata"),
+    }
+
+
+def get_custody_chain(analysis_id):
+    """Retrieve the full chain of custody for an analysis, ordered chronologically."""
+    url = (f"{SUPABASE_URL}/rest/v1/custody_log"
+           f"?analysis_id=eq.{analysis_id}&order=created_at.asc&select=*")
+    headers = {**sb_headers(), "Prefer": ""}
+    req = Request(url, headers=headers)
+    try:
+        return json.loads(urlopen(req).read())
+    except Exception as e:
+        print(f"[forensic] Custody chain fetch error: {e}")
+        return []
+
+
+def handle_forensic_export(data):
+    """Generate a court-ready forensic evidence package for an analysis."""
+    analysis_id = data.get("analysis_id")
+    if not analysis_id:
+        return {"error": "analysis_id required"}
+
+    rows = sb_get("analyses", {"id": analysis_id})
+    if not rows:
+        return {"error": "Analysis not found"}
+    a = rows[0]
+
+    if not a.get("evidence_hash"):
+        return {"error": "No forensic data available — analysis predates forensic system"}
+
+    # Get chain of custody
+    custody = get_custody_chain(analysis_id)
+
+    # Verify integrity before export
+    verification = verify_evidence_hash(analysis_id)
+
+    # Log the export event
+    log_custody(analysis_id, "forensic_exported", {
+        "integrity_verified": verification.get("verified", False),
+        "export_format": "text",
+    }, user_id=data.get("user_id"))
+
+    # Build the forensic certificate
+    meta = a.get("capture_metadata") or {}
+    sections = []
+
+    sections.append("═" * 72)
+    sections.append("         CERTIFICATE OF DIGITAL EVIDENCE EXTRACTION")
+    sections.append("                        TubeScribe Forensic")
+    sections.append("═" * 72)
+    sections.append("")
+    sections.append(f"  Source URL:         {a.get('youtube_url', 'N/A')}")
+    sections.append(f"  Video ID:          {meta.get('video_id', 'N/A')}")
+    sections.append(f"  Video Title:       {a.get('title', 'N/A')}")
+    sections.append(f"  Channel:           {a.get('channel', 'N/A')}")
+    sections.append(f"  Extraction Date:   {a.get('captured_at', 'N/A')}")
+    sections.append(f"  Extraction Method: {meta.get('source', 'N/A')}")
+    sections.append(f"  Worker Version:    {meta.get('worker_version', 'N/A')}")
+    sections.append(f"  Character Count:   {meta.get('raw_char_count', 'N/A')}")
+    sections.append(f"  Word Count:        {meta.get('raw_word_count', 'N/A')}")
+    sections.append("")
+    sections.append("─" * 72)
+    sections.append("  INTEGRITY VERIFICATION")
+    sections.append("─" * 72)
+    sections.append(f"  Hash Algorithm:    SHA-256")
+    sections.append(f"  Evidence Hash:     {a.get('evidence_hash', 'N/A')}")
+    sections.append(f"  Raw Text Hash:     {a.get('preserved_raw_hash', 'N/A')}")
+    v = verification
+    status = "✓ VERIFIED — transcript has not been modified since capture" if v.get("verified") else "✗ VERIFICATION FAILED — data may have been modified"
+    sections.append(f"  Integrity Status:  {status}")
+    sections.append("")
+    sections.append("─" * 72)
+    sections.append("  CHAIN OF CUSTODY")
+    sections.append("─" * 72)
+    for entry in custody:
+        ts = entry.get("created_at", "")[:19].replace("T", " ")
+        action = entry.get("action", "unknown")
+        actor = entry.get("actor", "unknown")
+        details = entry.get("details", {})
+        detail_str = ""
+        if isinstance(details, dict):
+            # Show key details without being overwhelming
+            important = {k: v for k, v in details.items() if k in (
+                "source", "evidence_hash", "char_count", "word_count",
+                "integrity_verified", "export_format", "verified", "match",
+                "note_length", "primary_model"
+            )}
+            if important:
+                detail_str = " | " + ", ".join(f"{k}={v}" for k, v in important.items())
+        sections.append(f"  [{ts}] {action} (by {actor}){detail_str}")
+    sections.append("")
+    sections.append("─" * 72)
+    sections.append("  RAW TRANSCRIPT (UNMODIFIED)")
+    sections.append("  The text below is the byte-exact original as captured.")
+    sections.append("─" * 72)
+    sections.append(a.get("preserved_raw_transcript", a.get("polished_transcript", "N/A")))
+    sections.append("")
+    sections.append("─" * 72)
+    sections.append("  AI-ENHANCED TRANSCRIPT (FOR REFERENCE ONLY)")
+    sections.append("  DISCLAIMER: This section has been processed by AI for readability.")
+    sections.append("  It is NOT the original evidence. Use the raw transcript above for")
+    sections.append("  evidentiary purposes.")
+    sections.append("─" * 72)
+    sections.append(a.get("polished_transcript", "N/A"))
+    sections.append("")
+    sections.append("═" * 72)
+    sections.append("  VERIFICATION INSTRUCTIONS")
+    sections.append("═" * 72)
+    sections.append("  To independently verify the integrity of this evidence:")
+    sections.append("  1. Extract the RAW TRANSCRIPT section above")
+    sections.append(f"  2. Compute: SHA-256(\"{meta.get('video_id', 'VIDEO_ID')}|{a.get('captured_at', 'TIMESTAMP')}|<raw_text>\")")
+    sections.append(f"  3. The result must match: {a.get('evidence_hash', 'N/A')}")
+    sections.append("  4. Independently, SHA-256 of just the raw text must match:")
+    sections.append(f"     {a.get('preserved_raw_hash', 'N/A')}")
+    sections.append("═" * 72)
+
+    return {
+        "text": "\n".join(sections),
+        "title": f"Forensic Evidence - {a.get('title', 'export')}",
+        "verification": verification,
+        "custody_chain": custody,
+    }
+
+
+def handle_verify_hash(data):
+    """Public endpoint to verify the integrity of an analysis's evidence hash."""
+    analysis_id = data.get("analysis_id")
+    if not analysis_id:
+        return {"error": "analysis_id required"}
+    return verify_evidence_hash(analysis_id)
+
+
+def handle_custody_log(data):
+    """Public endpoint to retrieve the chain of custody for an analysis."""
+    analysis_id = data.get("analysis_id")
+    if not analysis_id:
+        return {"error": "analysis_id required"}
+    return {"chain": get_custody_chain(analysis_id)}
+
 
 # ── YouTube helpers ──────────────────────────────────────────────────────────
 def extract_video_id(url):
@@ -1208,8 +1460,17 @@ def run_pipeline(record):
                         "Please use the 'Paste transcript manually' option on the dashboard.")
                 return
 
+        # ── Forensic: Preserve raw transcript & compute evidence hash ──
+        video_id = extract_video_id(youtube_url)
+        evidence_hash, captured_at = preserve_raw_transcript(
+            analysis_id, raw_transcript_text, video_id, used_source, user_id=user_id
+        )
+
         # ── AI Insights ──
         set_status(analysis_id, "processing")
+        log_custody(analysis_id, "ai_processing_started", {
+            "transcript_chars": len(raw_transcript_text),
+        }, user_id=user_id)
         # Pass raw_transcript_text to AI for polishing/analysis
         insights = generate_insights(raw_transcript_text, title, description, user_id=user_id)
 
@@ -1238,6 +1499,13 @@ def run_pipeline(record):
             **insights,
         })
 
+        log_custody(analysis_id, "ai_processed", {
+            "primary_model": ai_model_info.get("primary_model", "unknown"),
+            "models_used": ai_model_info.get("models_used", []),
+            "processing_time_seconds": ai_model_info.get("processing_time_seconds"),
+            "note_length": ai_model_info.get("note_length"),
+        }, user_id=user_id)
+
         # ── Save/update known speakers ──
         if speakers_info and user_id:
             save_identified_speakers(user_id, analysis_id, speakers_info)
@@ -1259,6 +1527,9 @@ def run_pipeline(record):
             extract_facts_and_entities(analysis_id, user_id, title, polished, description)
             extract_quotes_and_timeline(analysis_id, user_id, title, polished, description)
             detect_contradictions(analysis_id, user_id, title, polished)
+            log_custody(analysis_id, "enrichment_complete", {
+                "enrichments": ["facts", "entities", "quotes", "timeline", "contradictions"],
+            }, user_id=user_id)
             print(f"[worker] Post-pipeline enrichment complete for {analysis_id}")
         _th.Thread(target=_post_pipeline, daemon=True).start()
 
@@ -1877,7 +2148,7 @@ class Handler(BaseHTTPRequestHandler):
             fallbacks.append(f"groq ({GROQ_MODEL})")
         ai_fallback = " → ".join(fallbacks) if fallbacks else "none"
         self.wfile.write(json.dumps({
-            "status": "ok", "version": "v13", "supadata": supadata,
+            "status": "ok", "version": WORKER_VERSION, "supadata": supadata, "forensic": True,
             "ai_provider": AI_PROVIDER,
             "ai_primary": ai_primary,
             "ai_fallback": ai_fallback,
@@ -1940,6 +2211,39 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode())
             return
 
+        # ── Forensic export endpoint ──
+        if path == "/export-forensic":
+            result = handle_forensic_export(payload)
+            log_custody(payload.get("analysis_id"), "exported", {
+                "format": "forensic_certificate",
+            }, user_id=payload.get("user_id"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── Hash verification endpoint ──
+        if path == "/verify-hash":
+            result = handle_verify_hash(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── Custody log endpoint ──
+        if path == "/custody-log":
+            result = handle_custody_log(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
         # ── Default: webhook trigger ──
         record = payload.get("record", payload)
         if record.get("status", "pending") != "pending":
@@ -1968,6 +2272,7 @@ def handle_reprocess_insights(data):
     note_length = data.get("note_length", "medium")
     if not analysis_id:
         return {"error": "analysis_id required"}
+    log_custody(analysis_id, "reprocessed", {"note_length": note_length}, user_id=data.get("user_id"))
     
     rows = sb_get("analyses", {"id": analysis_id}, "title,user_id,polished_transcript,expanded_notes,summary")
     if not rows:
@@ -2028,6 +2333,7 @@ def handle_export(data):
     if not rows:
         return {"error": "Analysis not found"}
     a = rows[0]
+    log_custody(analysis_id, "exported", {"format": "standard"}, user_id=data.get("user_id"))
     utts = sb_get("speaker_utterances", {"analysis_id": analysis_id}, "text,diarization_label,start_seconds,end_seconds")
 
     speakers_info = []
@@ -2099,6 +2405,6 @@ def handle_export(data):
     return {"text": "\n".join(sections), "title": a.get("title", "export")}
 
 if __name__ == "__main__":
-    print(f"[worker] v8 — Supadata: {'enabled' if SUPADATA_API_KEY else 'not configured'}")
+    print(f"[worker] {WORKER_VERSION} — Supadata: {'enabled' if SUPADATA_API_KEY else 'not configured'} | Forensic: enabled")
     print(f"[worker] Listening on port {PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
