@@ -732,14 +732,22 @@ function ExportButton({ analysisId, title }: { analysisId: string; title: string
 // ── Forensic Export ───────────────────────────────────────────────────────────
 function ForensicExportButton({ analysisId, title }: { analysisId: string; title: string }) {
   const [exporting, setExporting] = useState(false);
+  const [showOptions, setShowOptions] = useState(false);
+  const [caseRef, setCaseRef] = useState("");
+  const [exhibitNo, setExhibitNo] = useState("");
+  const [exportType, setExportType] = useState<"full" | "summary">("full");
 
   async function handleForensicExport() {
     setExporting(true);
     try {
+      const body: Record<string, string> = { analysis_id: analysisId, format: exportType };
+      if (caseRef) body.case_reference = caseRef;
+      if (exhibitNo) body.exhibit_number = exhibitNo;
+
       const res = await fetch(`${WORKER_URL}/export-forensic`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ analysis_id: analysisId }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       if (data.error) {
@@ -757,6 +765,7 @@ function ForensicExportButton({ analysisId, title }: { analysisId: string; title
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
       toast.success("Forensic evidence package downloaded!");
+      setShowOptions(false);
     } catch (err: any) {
       toast.error(err.message);
     } finally {
@@ -765,10 +774,58 @@ function ForensicExportButton({ analysisId, title }: { analysisId: string; title
   }
 
   return (
-    <Button variant="outline" size="sm" onClick={handleForensicExport} disabled={exporting}>
-      {exporting ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Shield className="h-3.5 w-3.5 mr-1" />}
-      Court-Ready Export
-    </Button>
+    <div className="relative">
+      <div className="flex items-center gap-1">
+        <Button variant="outline" size="sm" onClick={handleForensicExport} disabled={exporting}>
+          {exporting ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <Shield className="h-3.5 w-3.5 mr-1" />}
+          Court-Ready Export
+        </Button>
+        <Button variant="ghost" size="sm" className="px-1.5" onClick={() => setShowOptions(!showOptions)}>
+          <ChevronDown className={`h-3.5 w-3.5 transition-transform ${showOptions ? "rotate-180" : ""}`} />
+        </Button>
+      </div>
+      {showOptions && (
+        <div className="absolute top-full right-0 mt-1 z-50 w-72 rounded-lg border bg-background p-3 shadow-lg space-y-3">
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">Case Reference</label>
+            <input
+              type="text"
+              value={caseRef}
+              onChange={(e) => setCaseRef(e.target.value)}
+              placeholder="e.g. Smith v. Jones, 24-CV-1234"
+              className="mt-1 w-full rounded-md border bg-muted/30 px-2 py-1.5 text-sm"
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">Exhibit Number</label>
+            <input
+              type="text"
+              value={exhibitNo}
+              onChange={(e) => setExhibitNo(e.target.value)}
+              placeholder="e.g. Exhibit A-3"
+              className="mt-1 w-full rounded-md border bg-muted/30 px-2 py-1.5 text-sm"
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">Export Type</label>
+            <div className="mt-1 flex gap-2">
+              <button
+                className={`flex-1 rounded-md border px-2 py-1.5 text-xs ${exportType === "full" ? "bg-primary/10 border-primary text-primary" : "bg-muted/30"}`}
+                onClick={() => setExportType("full")}
+              >
+                Full Package
+              </button>
+              <button
+                className={`flex-1 rounded-md border px-2 py-1.5 text-xs ${exportType === "summary" ? "bg-primary/10 border-primary text-primary" : "bg-muted/30"}`}
+                onClick={() => setExportType("summary")}
+              >
+                Summary Only
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

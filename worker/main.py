@@ -220,7 +220,14 @@ def get_custody_chain(analysis_id):
 
 
 def handle_forensic_export(data):
-    """Generate a court-ready forensic evidence package for an analysis."""
+    """Generate a court-ready forensic evidence package for an analysis.
+    
+    Options:
+      format: "full" (default) | "summary" — summary omits transcripts for filing cover sheets
+      case_reference: optional case number/title for header
+      exhibit_number: optional exhibit designation
+      attorney_name: optional preparing attorney name
+    """
     analysis_id = data.get("analysis_id")
     if not analysis_id:
         return {"error": "analysis_id required"}
@@ -233,90 +240,253 @@ def handle_forensic_export(data):
     if not a.get("evidence_hash"):
         return {"error": "No forensic data available — analysis predates forensic system"}
 
+    export_format = data.get("format", "full")
+    case_ref = data.get("case_reference", "")
+    exhibit_no = data.get("exhibit_number", "")
+    attorney = data.get("attorney_name", "")
+
     # Get chain of custody
     custody = get_custody_chain(analysis_id)
 
     # Verify integrity before export
     verification = verify_evidence_hash(analysis_id)
 
+    # Fetch enrichments for the report
+    headers_sb = {"apikey": os.environ["SUPABASE_KEY"],
+                  "Authorization": f"Bearer {os.environ['SUPABASE_KEY']}",
+                  "Content-Type": "application/json"}
+    base = os.environ["SUPABASE_URL"]
+    enrichments = {}
+    for table in ["quotes", "timeline_events", "contradictions", "speakers"]:
+        try:
+            turl = f"{base}/rest/v1/{table}?analysis_id=eq.{analysis_id}&select=*"
+            treq = Request(turl, headers=headers_sb)
+            enrichments[table] = json.loads(urlopen(treq).read())
+        except Exception:
+            enrichments[table] = []
+
     # Log the export event
     log_custody(analysis_id, "forensic_exported", {
         "integrity_verified": verification.get("verified", False),
-        "export_format": "text",
+        "export_format": export_format,
+        "case_reference": case_ref or None,
+        "exhibit_number": exhibit_no or None,
     }, user_id=data.get("user_id"))
 
     # Build the forensic certificate
     meta = a.get("capture_metadata") or {}
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     sections = []
 
+    # ── Header ──
     sections.append("═" * 72)
     sections.append("         CERTIFICATE OF DIGITAL EVIDENCE EXTRACTION")
     sections.append("                        TubeScribe Forensic")
     sections.append("═" * 72)
     sections.append("")
+    if case_ref:
+        sections.append(f"  Case:              {case_ref}")
+    if exhibit_no:
+        sections.append(f"  Exhibit:           {exhibit_no}")
+    if attorney:
+        sections.append(f"  Prepared by:       {attorney}")
+    sections.append(f"  Report generated:  {now}")
+    sections.append(f"  Report type:       {'Full Evidence Package' if export_format == 'full' else 'Summary Cover Sheet'}")
+    sections.append("")
+
+    # ── Source identification ──
+    sections.append("─" * 72)
+    sections.append("  SECTION 1: SOURCE IDENTIFICATION")
+    sections.append("─" * 72)
+    sections.append(f"  Platform:          YouTube (www.youtube.com)")
     sections.append(f"  Source URL:         {a.get('youtube_url', 'N/A')}")
-    sections.append(f"  Video ID:          {meta.get('video_id', 'N/A')}")
+    sections.append(f"  Video ID:          {meta.get('video_id', a.get('youtube_id', 'N/A'))}")
     sections.append(f"  Video Title:       {a.get('title', 'N/A')}")
     sections.append(f"  Channel:           {a.get('channel', 'N/A')}")
+    if a.get("likely_production_date"):
+        sections.append(f"  Est. Prod. Date:   {a.get('likely_production_date')}")
+        if a.get("production_date_reasoning"):
+            sections.append(f"  Date Reasoning:    {a.get('production_date_reasoning')[:200]}")
+    sections.append("")
+
+    # ── Extraction details ──
+    sections.append("─" * 72)
+    sections.append("  SECTION 2: EXTRACTION DETAILS")
+    sections.append("─" * 72)
     sections.append(f"  Extraction Date:   {a.get('captured_at', 'N/A')}")
     sections.append(f"  Extraction Method: {meta.get('source', 'N/A')}")
-    sections.append(f"  Worker Version:    {meta.get('worker_version', 'N/A')}")
+    sections.append(f"  Extraction Tool:   TubeScribe Forensic {meta.get('worker_version', WORKER_VERSION)}")
     sections.append(f"  Character Count:   {meta.get('raw_char_count', 'N/A')}")
     sections.append(f"  Word Count:        {meta.get('raw_word_count', 'N/A')}")
+    if meta.get("deepgram_model"):
+        sections.append(f"  Audio Model:       {meta.get('deepgram_model')}")
+    if meta.get("language"):
+        sections.append(f"  Language:          {meta.get('language')}")
     sections.append("")
+
+    # ── Integrity verification ──
     sections.append("─" * 72)
-    sections.append("  INTEGRITY VERIFICATION")
+    sections.append("  SECTION 3: INTEGRITY VERIFICATION")
     sections.append("─" * 72)
     sections.append(f"  Hash Algorithm:    SHA-256")
     sections.append(f"  Evidence Hash:     {a.get('evidence_hash', 'N/A')}")
     sections.append(f"  Raw Text Hash:     {a.get('preserved_raw_hash', 'N/A')}")
+    sections.append(f"  Hash Input Format: SHA-256(video_id|captured_at|raw_transcript_text)")
     v = verification
-    status = "✓ VERIFIED — transcript has not been modified since capture" if v.get("verified") else "✗ VERIFICATION FAILED — data may have been modified"
-    sections.append(f"  Integrity Status:  {status}")
+    if v.get("verified"):
+        sections.append(f"  Integrity Status:  ✓ VERIFIED")
+        sections.append(f"  Verification Note: Transcript has not been modified since capture.")
+        sections.append(f"                     Hash recomputed at {now} and matches stored hash.")
+    else:
+        sections.append(f"  Integrity Status:  ✗ VERIFICATION FAILED")
+        sections.append(f"  Warning:           Data may have been modified since original capture.")
+        if v.get("stored_hash") and v.get("computed_hash"):
+            sections.append(f"  Stored Hash:       {v.get('stored_hash')}")
+            sections.append(f"  Computed Hash:     {v.get('computed_hash')}")
     sections.append("")
+
+    # ── Speaker identification ──
+    speakers = enrichments.get("speakers", [])
+    if speakers:
+        sections.append("─" * 72)
+        sections.append("  SECTION 4: SPEAKER IDENTIFICATION")
+        sections.append("─" * 72)
+        for s in speakers:
+            label = s.get("label", "Unknown")
+            name = s.get("display_name", label)
+            sections.append(f"  {label}: {name}")
+        sections.append("")
+
+    # ── Chain of custody ──
     sections.append("─" * 72)
-    sections.append("  CHAIN OF CUSTODY")
+    sec_num = 5 if speakers else 4
+    sections.append(f"  SECTION {sec_num}: CHAIN OF CUSTODY")
     sections.append("─" * 72)
-    for entry in custody:
+    sections.append(f"  Total entries: {len(custody)}")
+    sections.append("")
+    for i, entry in enumerate(custody, 1):
         ts = entry.get("created_at", "")[:19].replace("T", " ")
         action = entry.get("action", "unknown")
         actor = entry.get("actor", "unknown")
         details = entry.get("details", {})
-        detail_str = ""
+        sections.append(f"  {i:3d}. [{ts}] {action.upper()}")
+        sections.append(f"       Actor: {actor}")
         if isinstance(details, dict):
-            # Show key details without being overwhelming
-            important = {k: v for k, v in details.items() if k in (
+            important = {k: dv for k, dv in details.items() if k in (
                 "source", "evidence_hash", "char_count", "word_count",
                 "integrity_verified", "export_format", "verified", "match",
-                "note_length", "primary_model"
+                "note_length", "primary_model", "format", "case_reference"
             )}
-            if important:
-                detail_str = " | " + ", ".join(f"{k}={v}" for k, v in important.items())
-        sections.append(f"  [{ts}] {action} (by {actor}){detail_str}")
+            for k, dv in important.items():
+                sections.append(f"       {k}: {dv}")
+        sections.append("")
+
+    # ── AI Analysis Summary (for attorney reference) ──
+    sec_num += 1
+    sections.append("─" * 72)
+    sections.append(f"  SECTION {sec_num}: AI ANALYSIS SUMMARY (FOR REFERENCE ONLY)")
+    sections.append("  DISCLAIMER: This section was generated by AI and is provided for")
+    sections.append("  attorney reference only. It is NOT original evidence.")
+    sections.append("─" * 72)
+    if a.get("summary"):
+        sections.append("")
+        sections.append("  Summary:")
+        for line in a["summary"].split("\n"):
+            sections.append(f"    {line}")
+    # Sentiment
+    sentiment = a.get("sentiment")
+    if isinstance(sentiment, str):
+        try: sentiment = json.loads(sentiment)
+        except Exception: pass
+    if isinstance(sentiment, dict) and sentiment.get("overall"):
+        sections.append("")
+        sections.append(f"  Overall Sentiment: {sentiment['overall']}")
     sections.append("")
-    sections.append("─" * 72)
-    sections.append("  RAW TRANSCRIPT (UNMODIFIED)")
-    sections.append("  The text below is the byte-exact original as captured.")
-    sections.append("─" * 72)
-    sections.append(a.get("preserved_raw_transcript", a.get("polished_transcript", "N/A")))
-    sections.append("")
-    sections.append("─" * 72)
-    sections.append("  AI-ENHANCED TRANSCRIPT (FOR REFERENCE ONLY)")
-    sections.append("  DISCLAIMER: This section has been processed by AI for readability.")
-    sections.append("  It is NOT the original evidence. Use the raw transcript above for")
-    sections.append("  evidentiary purposes.")
-    sections.append("─" * 72)
-    sections.append(a.get("polished_transcript", "N/A"))
-    sections.append("")
+
+    # Notable quotes
+    quotes = enrichments.get("quotes", [])
+    if quotes:
+        sections.append(f"  Notable Quotes ({len(quotes)} extracted):")
+        for q in quotes[:10]:
+            speaker = q.get("speaker", "Unknown")
+            text = q.get("quote_text", "")[:300]
+            sections.append(f'    - "{text}" — {speaker}')
+            if q.get("significance"):
+                sections.append(f"      Significance: {q['significance'][:200]}")
+        if len(quotes) > 10:
+            sections.append(f"    ... and {len(quotes) - 10} more")
+        sections.append("")
+
+    # Timeline
+    timeline = enrichments.get("timeline_events", [])
+    if timeline:
+        sections.append(f"  Timeline Events ({len(timeline)} extracted):")
+        for t in timeline[:15]:
+            date = t.get("event_date", "Unknown date")
+            title = t.get("title", "")[:200]
+            sections.append(f"    [{date}] {title}")
+        if len(timeline) > 15:
+            sections.append(f"    ... and {len(timeline) - 15} more")
+        sections.append("")
+
+    # Contradictions
+    contradictions = enrichments.get("contradictions", [])
+    if contradictions:
+        sections.append(f"  Contradictions Detected ({len(contradictions)}):")
+        for c in contradictions:
+            sections.append(f"    Statement A: {c.get('statement_a', '')[:200]}")
+            sections.append(f"    Statement B: {c.get('statement_b', '')[:200]}")
+            if c.get("explanation"):
+                sections.append(f"    Analysis: {c['explanation'][:200]}")
+            sections.append("")
+
+    if export_format == "full":
+        # ── Raw transcript ──
+        sec_num += 1
+        sections.append("─" * 72)
+        sections.append(f"  SECTION {sec_num}: RAW TRANSCRIPT (UNMODIFIED)")
+        sections.append("  The text below is the byte-exact original as captured.")
+        sections.append("  This section constitutes the primary evidence.")
+        sections.append("─" * 72)
+        sections.append(a.get("preserved_raw_transcript", a.get("polished_transcript", "N/A")))
+        sections.append("")
+
+        # ── AI-enhanced transcript ──
+        sec_num += 1
+        sections.append("─" * 72)
+        sections.append(f"  SECTION {sec_num}: AI-ENHANCED TRANSCRIPT (FOR REFERENCE ONLY)")
+        sections.append("  DISCLAIMER: This section has been processed by AI for readability.")
+        sections.append("  It is NOT the original evidence. Use the raw transcript above for")
+        sections.append("  evidentiary purposes.")
+        sections.append("─" * 72)
+        sections.append(a.get("polished_transcript", "N/A"))
+        sections.append("")
+
+    # ── Verification instructions ──
     sections.append("═" * 72)
-    sections.append("  VERIFICATION INSTRUCTIONS")
+    sections.append("  INDEPENDENT VERIFICATION INSTRUCTIONS")
     sections.append("═" * 72)
-    sections.append("  To independently verify the integrity of this evidence:")
-    sections.append("  1. Extract the RAW TRANSCRIPT section above")
+    sections.append("")
+    sections.append("  Method 1: Evidence Hash Verification")
+    sections.append("  1. Extract the RAW TRANSCRIPT section text")
     sections.append(f"  2. Compute: SHA-256(\"{meta.get('video_id', 'VIDEO_ID')}|{a.get('captured_at', 'TIMESTAMP')}|<raw_text>\")")
-    sections.append(f"  3. The result must match: {a.get('evidence_hash', 'N/A')}")
-    sections.append("  4. Independently, SHA-256 of just the raw text must match:")
-    sections.append(f"     {a.get('preserved_raw_hash', 'N/A')}")
+    sections.append(f"  3. Result must match: {a.get('evidence_hash', 'N/A')}")
+    sections.append("")
+    sections.append("  Method 2: Raw Text Hash Verification")
+    sections.append("  1. Extract the RAW TRANSCRIPT section text")
+    sections.append("  2. Compute: SHA-256(<raw_text>)")
+    sections.append(f"  3. Result must match: {a.get('preserved_raw_hash', 'N/A')}")
+    sections.append("")
+    sections.append("  Method 3: API Verification")
+    sections.append(f"  POST {WORKER_URL if 'WORKER_URL' in dir() else 'https://<worker-url>'}/verify-hash")
+    sections.append(f'  Body: {{"analysis_id": "{analysis_id}"}}')
+    sections.append("")
+    sections.append("  Note: The hash input format uses UTF-8 encoding with pipe (|)")
+    sections.append("  separators. Whitespace in the raw text is preserved exactly.")
+    sections.append("")
+    sections.append("═" * 72)
+    sections.append(f"  END OF CERTIFICATE — Generated {now}")
+    sections.append(f"  TubeScribe Forensic {WORKER_VERSION}")
     sections.append("═" * 72)
 
     return {
@@ -324,15 +494,143 @@ def handle_forensic_export(data):
         "title": f"Forensic Evidence - {a.get('title', 'export')}",
         "verification": verification,
         "custody_chain": custody,
+        "format": export_format,
+        "sections": {
+            "source": True,
+            "extraction": True,
+            "integrity": True,
+            "speakers": bool(speakers),
+            "custody": True,
+            "ai_analysis": True,
+            "raw_transcript": export_format == "full",
+            "ai_transcript": export_format == "full",
+            "verification_instructions": True,
+        }
     }
 
 
 def handle_verify_hash(data):
-    """Public endpoint to verify the integrity of an analysis's evidence hash."""
+    """Public endpoint to verify the integrity of an analysis's evidence hash.
+    Returns detailed verification report including timing and metadata."""
     analysis_id = data.get("analysis_id")
     if not analysis_id:
         return {"error": "analysis_id required"}
-    return verify_evidence_hash(analysis_id)
+    
+    start = time.time()
+    result = verify_evidence_hash(analysis_id)
+    elapsed = round(time.time() - start, 3)
+    
+    # Enrich with verification metadata
+    result["verified_at"] = datetime.now(timezone.utc).isoformat()
+    result["verification_time_ms"] = int(elapsed * 1000)
+    result["worker_version"] = WORKER_VERSION
+    result["hash_algorithm"] = "SHA-256"
+    
+    return result
+
+
+def handle_bulk_verify(data):
+    """Verify evidence integrity for multiple analyses at once.
+    
+    Input: {"analysis_ids": ["id1", "id2", ...]}
+    Returns: {"results": [{"analysis_id": ..., "verified": ..., ...}, ...], "summary": {...}}
+    """
+    analysis_ids = data.get("analysis_ids", [])
+    if not analysis_ids:
+        return {"error": "analysis_ids array required"}
+    if len(analysis_ids) > 50:
+        return {"error": "Maximum 50 analyses per bulk verification"}
+    
+    results = []
+    for aid in analysis_ids:
+        r = verify_evidence_hash(aid)
+        r["analysis_id"] = aid
+        results.append(r)
+    
+    verified_count = sum(1 for r in results if r.get("verified"))
+    failed_count = sum(1 for r in results if r.get("verified") is False)
+    no_data = sum(1 for r in results if "error" in r)
+    
+    return {
+        "results": results,
+        "summary": {
+            "total": len(analysis_ids),
+            "verified": verified_count,
+            "failed": failed_count,
+            "no_forensic_data": no_data,
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+        }
+    }
+
+
+def handle_bulk_forensic_export(data):
+    """Generate a combined forensic evidence report for multiple analyses.
+    
+    Input: {"analysis_ids": ["id1", "id2", ...], "case_reference": "...", ...}
+    Returns: {"text": "...", "summary": {...}}
+    """
+    analysis_ids = data.get("analysis_ids", [])
+    if not analysis_ids:
+        return {"error": "analysis_ids array required"}
+    if len(analysis_ids) > 20:
+        return {"error": "Maximum 20 analyses per bulk export"}
+    
+    case_ref = data.get("case_reference", "")
+    attorney = data.get("attorney_name", "")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    sections = []
+    sections.append("═" * 72)
+    sections.append("           BULK EVIDENCE INTEGRITY REPORT")
+    sections.append("                  TubeScribe Forensic")
+    sections.append("═" * 72)
+    sections.append("")
+    if case_ref:
+        sections.append(f"  Case:              {case_ref}")
+    if attorney:
+        sections.append(f"  Prepared by:       {attorney}")
+    sections.append(f"  Report generated:  {now}")
+    sections.append(f"  Evidence items:    {len(analysis_ids)}")
+    sections.append("")
+    
+    all_verified = True
+    for i, aid in enumerate(analysis_ids, 1):
+        rows = sb_get("analyses", {"id": aid})
+        if not rows:
+            sections.append(f"  {i}. [NOT FOUND] Analysis {aid}")
+            sections.append("")
+            all_verified = False
+            continue
+        a = rows[0]
+        v = verify_evidence_hash(aid)
+        verified = v.get("verified", False)
+        if not verified:
+            all_verified = False
+        
+        status_icon = "✓" if verified else ("✗" if a.get("evidence_hash") else "○")
+        sections.append(f"  {i}. [{status_icon}] {a.get('title', 'Untitled')}")
+        sections.append(f"       URL: {a.get('youtube_url', 'N/A')}")
+        sections.append(f"       Hash: {a.get('evidence_hash', 'No forensic data')[:32]}{'...' if a.get('evidence_hash') else ''}")
+        sections.append(f"       Captured: {a.get('captured_at', 'N/A')}")
+        sections.append(f"       Status: {'VERIFIED' if verified else 'UNVERIFIED' if not a.get('evidence_hash') else 'FAILED'}")
+        sections.append("")
+    
+    sections.append("─" * 72)
+    sections.append(f"  OVERALL STATUS: {'ALL EVIDENCE VERIFIED ✓' if all_verified else 'SOME ITEMS REQUIRE ATTENTION'}")
+    sections.append("─" * 72)
+    sections.append("")
+    sections.append(f"  For individual evidence certificates, use the /export-forensic endpoint.")
+    sections.append("")
+    sections.append("═" * 72)
+    sections.append(f"  END OF BULK REPORT — Generated {now}")
+    sections.append("═" * 72)
+    
+    return {
+        "text": "\n".join(sections),
+        "title": f"Bulk Evidence Report - {case_ref or 'TubeScribe'}",
+        "all_verified": all_verified,
+        "count": len(analysis_ids),
+    }
 
 
 def handle_custody_log(data):
@@ -2591,6 +2889,26 @@ class Handler(BaseHTTPRequestHandler):
         # ── Custody log endpoint ──
         if path == "/custody-log":
             result = handle_custody_log(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── Bulk verify endpoint ──
+        if path == "/bulk-verify":
+            result = handle_bulk_verify(payload)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+
+        # ── Bulk forensic export endpoint ──
+        if path == "/bulk-forensic-export":
+            result = handle_bulk_forensic_export(payload)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._cors_headers()
