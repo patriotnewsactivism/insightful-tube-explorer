@@ -92,7 +92,173 @@ def sb_insert(table, rows):
     except HTTPError as e:
         print(f"[sb_insert] {e.status}: {e.read()}")
 
-WORKER_VERSION = "v14"
+WORKER_VERSION = "v15"
+
+# ── Legal Precision: Plain-Text Sanitizer ────────────────────────────────────
+
+def sanitize_for_legal(text):
+    """Remove all markdown formatting for legal document compatibility.
+
+    Converts AI output to clean plain text suitable for court filings:
+    - Strips markdown headers (# ## ###)
+    - Converts bold/italic markers to plain text
+    - Removes code blocks and backticks
+    - Converts markdown lists to plain text with indentation
+    - Preserves paragraph structure and timestamps
+    """
+    if not text:
+        return text
+    # Strip markdown headers
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Remove bold markers (**text** or __text__)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    # Remove italic markers (*text* or _text_) — careful not to hit list bullets
+    text = re.sub(r'(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)', r'\1', text)
+    text = re.sub(r'(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)', r'\1', text)
+    # Remove code blocks
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    # Remove blockquotes
+    text = re.sub(r'^>\s+', '', text, flags=re.MULTILINE)
+    # Convert markdown bullet lists to plain text
+    text = re.sub(r'^[-*+]\s+', '  - ', text, flags=re.MULTILINE)
+    # Keep numbered lists but normalize
+    text = re.sub(r'^(\d+)\.\s+', r'  \1. ', text, flags=re.MULTILINE)
+    # Remove horizontal rules
+    text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+    # Remove markdown links, keep text: [text](url) -> text
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # Remove markdown images
+    text = re.sub(r'!\[([^\]]*)\]\([^)]+\)', r'\1', text)
+    # Collapse excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ── Legal Precision: Confidence Score Computation ────────────────────────────
+
+def compute_confidence_score(claim_text, source_type="deepgram_nova2", speaker_identified=True, corroboration_count=0):
+    """Compute a confidence score (0.0-1.0) for a factual claim.
+
+    Factors:
+    - Source reliability: audio transcription > captions > pasted
+    - Speaker identification confidence
+    - Hedging language detection
+    - Corroboration from multiple mentions
+    """
+    score = 0.5  # baseline
+
+    # Source reliability bonus
+    source_bonuses = {
+        "deepgram_nova2": 0.2,
+        "supadata_api": 0.1,
+        "youtube_captions": 0.05,
+        "pasted_transcript": 0.0,
+    }
+    score += source_bonuses.get(source_type, 0.0)
+
+    # Speaker identification
+    if speaker_identified:
+        score += 0.1
+
+    # Hedging language penalty
+    hedging_terms = ["maybe", "i think", "possibly", "might", "could be",
+                     "not sure", "i believe", "probably", "apparently",
+                     "allegedly", "reportedly", "it seems"]
+    claim_lower = (claim_text or "").lower()
+    hedging_count = sum(1 for term in hedging_terms if term in claim_lower)
+    score -= min(hedging_count * 0.08, 0.25)
+
+    # Corroboration bonus
+    score += min(corroboration_count * 0.05, 0.15)
+
+    return round(max(0.0, min(1.0, score)), 2)
+
+
+# ── Legal Precision: Legal Entity Extraction ─────────────────────────────────
+
+# Regex patterns for common legal references
+LEGAL_PATTERNS = {
+    "case_number_federal": re.compile(r'\b\d{1,2}:\d{2}-[a-z]{2}-\d{4,6}\b', re.IGNORECASE),
+    "case_number_state": re.compile(r'\b(?:Case|No\.?|Cause)\s*(?:No\.?\s*)?[\d\-]+[A-Z]*\d*\b', re.IGNORECASE),
+    "reporter_citation": re.compile(r'\b\d+\s+(?:U\.?S\.?|S\.?\s*Ct\.?|L\.?\s*Ed\.?|F\.?\s*(?:2d|3d|4th)?|So\.?\s*(?:2d|3d)?)\s+\d+\b'),
+    "us_code": re.compile(r'\b\d+\s+U\.?S\.?C\.?\s*§\s*\d+[a-z]?\b'),
+    "cfr": re.compile(r'\b\d+\s+C\.?F\.?R\.?\s*§?\s*\d+(?:\.\d+)?\b'),
+    "state_code": re.compile(r'\b(?:Cal|Tex|Fla|N\.?Y|Ohio|Ill)\.?\s*(?:Civ|Pen|Gov|Fam|Prob|Bus|Lab|Health|Educ)\.?\s*(?:Code|Proc)\.?\s*§\s*\d+\b', re.IGNORECASE),
+    "constitutional": re.compile(r'\b(?:First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth|Thirteenth|Fourteenth|Fifteenth)\s+Amendment\b', re.IGNORECASE),
+    "court": re.compile(r'\b(?:Supreme Court|District Court|Circuit Court|Court of Appeals|Superior Court|Municipal Court|Family Court|Bankruptcy Court|Tax Court)\b', re.IGNORECASE),
+}
+
+
+def extract_legal_entities_regex(text):
+    """Extract legal entities using regex patterns. Returns list of dicts."""
+    if not text:
+        return []
+    entities = []
+    seen = set()
+    for entity_type, pattern in LEGAL_PATTERNS.items():
+        for match in pattern.finditer(text):
+            value = match.group().strip()
+            key = (entity_type, value.lower())
+            if key not in seen:
+                seen.add(key)
+                # Map regex pattern name to entity_type
+                if entity_type.startswith("case_number"):
+                    etype = "case_number"
+                elif entity_type in ("us_code", "cfr", "state_code"):
+                    etype = "statute"
+                elif entity_type == "reporter_citation":
+                    etype = "case_citation"
+                elif entity_type == "constitutional":
+                    etype = "constitutional_provision"
+                elif entity_type == "court":
+                    etype = "court"
+                else:
+                    etype = entity_type
+                entities.append({
+                    "entity_type": etype,
+                    "name": value,
+                    "source": "regex",
+                    "context": text[max(0, match.start()-50):match.end()+50],
+                })
+    return entities
+
+
+def save_legal_entities(user_id, analysis_id, legal_entities):
+    """Save extracted legal entities to the legal_entities table."""
+    if not legal_entities or not user_id:
+        return
+    try:
+        # Fetch existing to deduplicate
+        existing = sb_get("legal_entities", {"user_id": user_id}, "id,name,entity_type")
+        existing_keys = {(e["name"].lower(), e["entity_type"]) for e in (existing or [])}
+
+        rows = []
+        for ent in legal_entities:
+            name = ent.get("name", "").strip()
+            etype = ent.get("entity_type", "unknown")
+            if not name or (name.lower(), etype) in existing_keys:
+                continue
+            existing_keys.add((name.lower(), etype))
+            rows.append({
+                "user_id": user_id,
+                "entity_type": etype,
+                "name": name,
+                "jurisdiction": ent.get("jurisdiction"),
+                "full_citation": ent.get("full_citation"),
+                "description": ent.get("description", ""),
+                "first_seen_analysis": analysis_id,
+                "confidence_score": ent.get("confidence_score", 0.5),
+                "metadata": {"source": ent.get("source", "regex"), "context": ent.get("context", "")},
+            })
+        if rows:
+            for i in range(0, len(rows), 50):
+                sb_insert("legal_entities", rows[i:i+50])
+            print(f"[legal] Saved {len(rows)} legal entities for {analysis_id}")
+    except Exception as e:
+        print(f"[legal] Save error: {e}")
+
 
 # ── Forensic Evidence Helpers ────────────────────────────────────────────────
 
@@ -1101,74 +1267,84 @@ def _get_notes_prompt(research_ctx, note_length="medium"):
     if note_length == "short":
         return f"""{research_ctx}\n\nProduce concise research notes (~1 page) from this video transcript.
 
-Use these sections:
-## Key Topics (bullet points)
-## Top 3 Claims (who said what)
-## People Mentioned (name and role)
-## Notable Quotes (2-3 most significant)
+Use these sections (as plain text headers with a line of dashes underneath, no markdown):
+
+KEY TOPICS
+(bullet points using dashes)
+
+TOP 3 CLAIMS
+(who said what)
+
+PEOPLE MENTIONED
+(name and role)
+
+NOTABLE QUOTES
+(2-3 most significant)
 
 Keep it brief and scannable."""
     elif note_length == "detailed":
         return f"""{research_ctx}\n\nProduce exhaustive, comprehensive expanded research notes from this video transcript. Extract EVERY piece of useful information. Leave nothing out.
 
-Use these sections:
-## Main Topics
+Use these sections (as plain text headers in ALL CAPS with a line of dashes underneath, no markdown):
+
+MAIN TOPICS
 (List and explain every topic discussed in depth, not just headlines)
 
-## Key Claims & Allegations
+KEY CLAIMS AND ALLEGATIONS
 (Every factual claim, allegation, or assertion made — include who said it, when, and any supporting evidence mentioned)
 
-## People & Organizations
+PEOPLE AND ORGANIZATIONS
 (Every person and organization mentioned, with their role, what was said about them, and relationships to other mentioned parties)
 
-## Legal & Official Proceedings
+LEGAL AND OFFICIAL PROCEEDINGS
 (Any court cases, filings, hearings, laws, statutes, or official actions referenced — include case numbers if mentioned)
 
-## Notable Quotes
+NOTABLE QUOTES
 (All significant direct quotes with full speaker attribution and context)
 
-## Timeline of Events
+TIMELINE OF EVENTS
 (Detailed chronological sequence of all events discussed)
 
-## Data & Statistics
+DATA AND STATISTICS
 (Any numbers, percentages, dates, or quantitative claims)
 
-## Action Items & Next Steps
+ACTION ITEMS AND NEXT STEPS
 (Everything mentioned as needing to be done, by whom, and any deadlines)
 
-## Unanswered Questions
+UNANSWERED QUESTIONS
 (All questions raised but not answered in the video)
 
-## Cross-References
+CROSS-REFERENCES
 (Connections to other events, people, or cases mentioned)
 
 Be maximally exhaustive. A researcher using these notes should NEVER need to re-watch the video."""
     else:  # medium (default)
         return f"""{research_ctx}\n\nProduce comprehensive expanded research notes from this video transcript. Be thorough and extract ALL useful information.
 
-Use these sections:
-## Main Topics
+Use these sections (as plain text headers in ALL CAPS with a line of dashes underneath, no markdown):
+
+MAIN TOPICS
 (List and explain every topic discussed, not just headlines)
 
-## Key Claims & Allegations
+KEY CLAIMS AND ALLEGATIONS
 (Every factual claim, allegation, or assertion made — include who said it)
 
-## People & Organizations
+PEOPLE AND ORGANIZATIONS
 (Every person and organization mentioned, with their role and what was said about them)
 
-## Legal & Official Proceedings
+LEGAL AND OFFICIAL PROCEEDINGS
 (Any court cases, filings, hearings, laws, or official actions referenced)
 
-## Notable Quotes
+NOTABLE QUOTES
 (Direct quotes that are significant, with speaker attribution)
 
-## Timeline of Events
+TIMELINE OF EVENTS
 (Chronological sequence of events discussed)
 
-## Action Items & Next Steps
+ACTION ITEMS AND NEXT STEPS
 (Anything mentioned as needing to be done)
 
-## Unanswered Questions
+UNANSWERED QUESTIONS
 (Questions raised but not answered in the video)
 
 Be exhaustive. A researcher using these notes should not need to re-watch the video."""
@@ -1194,17 +1370,24 @@ def generate_insights(transcript, title, description="", user_id=None, note_leng
     # System preamble for all prompts — helps avoid Azure content filter refusals
     research_ctx = "You are a professional research assistant helping a journalist and author document public records, court proceedings, and civic matters for a nonfiction book. All content is from publicly available YouTube videos. Your role is to accurately transcribe, summarize, and organize this public interest content."
 
+    # Legal precision: instruct all prompts to output plain text
+    plain_text_rule = "\n\nIMPORTANT: Output plain text only. Do NOT use markdown formatting — no asterisks, no hash symbols for headers, no backticks, no bold/italic markers. Use plain text with line breaks, indentation, and numbered/bulleted lists (using dashes) for structure. This output will be used in legal documents."
+
     prompts = [
-        (f"{research_ctx}\n\nProduce a thorough summary of this video. Include: the main topic, all key points discussed, names of people and organizations mentioned, any legal proceedings or events described, and the overall significance. Be detailed — aim for 2-3 paragraphs, not just a few sentences.",
+        # 1st call: Summary (plain text)
+        (f"{research_ctx}{plain_text_rule}\n\nProduce a thorough summary of this video. Include: the main topic, all key points discussed, names of people and organizations mentioned, any legal proceedings or events described, and the overall significance. Be detailed — aim for 2-3 paragraphs, not just a few sentences.",
          f"{ctx}Transcript:\n{t_short}"),
+        # 2nd call: Sentiment (JSON — no plain_text_rule needed)
         (f'{research_ctx}\n\nAnalyze the tone and return ONLY valid JSON (no markdown): {{"overall":"positive"|"negative"|"neutral"|"mixed","score":<-1.0 to 1.0>,"tone":"<brief>","key_emotions":["..."]}}',
          f"{ctx}Transcript:\n{t_short}"),
-        (_get_notes_prompt(research_ctx, note_length),
+        # 3rd call: Notes (plain text)
+        (_get_notes_prompt(research_ctx, note_length) + plain_text_rule,
          f"{ctx}Transcript:\n{t_medium}"),
+        # 4th call: Date estimation (JSON — no plain_text_rule needed)
         (f'{research_ctx}\n\nAnalyze for clues about when this content was produced. Return ONLY valid JSON (no markdown): {{"likely_production_date":"<date range>","reasoning":"<brief>"}}',
          f"{ctx}Transcript:\n{t_short}"),
-        # 5th call: Speaker-aware polished transcript (placeholder — may be replaced by chunked version below)
-        (f'''{research_ctx}
+        # 5th call: Speaker-aware polished transcript (plain text)
+        (f'''{research_ctx}{plain_text_rule}
 
 You are an expert transcript editor. Create a polished, readable version of this COMPLETE transcript for research documentation purposes. Do NOT truncate, summarize, or skip any part of the transcript.
 
@@ -1214,13 +1397,13 @@ Rules:
 3. Fix obvious transcription errors, grammar issues, and filler words (um, uh, like)
 4. Add paragraph breaks at natural topic shifts
 5. Keep the meaning 100% accurate — never change what was said, only how it reads
-6. Format as: **Speaker Name:** Their dialogue here...
+6. Format speaker labels as: SPEAKER NAME: Their dialogue here...
 7. Add [timestamp] markers every few paragraphs if timing info is available
 8. Include EVERY part of the conversation from start to finish{speaker_ctx}
 
 Return ONLY the polished transcript text, no other commentary. Do not skip or summarize any sections.''',
          f"{ctx}Transcript:\n{transcript[:60000]}"),
-        # 6th call: Speaker identification JSON
+        # 6th call: Speaker identification (JSON — no plain_text_rule needed)
         (f'''{research_ctx}
 
 Identify all speakers in this transcript for research indexing. Return ONLY valid JSON (no markdown):
@@ -1247,6 +1430,11 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
     print(f"[worker] 6 OpenAI calls completed in {elapsed:.1f}s (parallel) — models: {models_used}")
     summary, sentiment_raw, notes, date_raw, polished_text, speakers_raw = results
 
+    # Legal precision: sanitize all text outputs to plain text
+    summary = sanitize_for_legal(summary)
+    notes = sanitize_for_legal(notes)
+    polished_text = sanitize_for_legal(polished_text)
+
     # If transcript is very long, process polished transcript in chunks and combine
     if len(transcript) > 60000 and (not polished_text or len(polished_text) < len(transcript) * 0.3):
         print(f"[worker] Transcript is {len(transcript)} chars, processing polished transcript in chunks...")
@@ -1255,12 +1443,13 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
         polished_parts = []
         for ci, chunk in enumerate(chunks):
             part = call_openai(
-                f'''{research_ctx}\n\nYou are an expert transcript editor. Polish this section (part {ci+1} of {len(chunks)}) into clean, readable text. Fix grammar, add speaker labels, add paragraph breaks. Do NOT skip or summarize any content. Output ONLY the polished text.{speaker_ctx}''',
+                f'''{research_ctx}{plain_text_rule}\n\nYou are an expert transcript editor. Polish this section (part {ci+1} of {len(chunks)}) into clean, readable text. Fix grammar, add speaker labels (SPEAKER NAME: format), add paragraph breaks. Do NOT skip or summarize any content. Output ONLY the polished text.{speaker_ctx}''',
                 f"{ctx}Transcript section {ci+1}/{len(chunks)}:\n{chunk}",
                 16000
             )
             polished_parts.append(part)
         polished_text = "\n\n".join(polished_parts)
+        polished_text = sanitize_for_legal(polished_text)
         print(f"[worker] Chunked polished transcript: {len(polished_text)} chars from {len(chunks)} chunks")
 
     # Detect Azure content filter refusals and retry with softer framing
@@ -1283,6 +1472,7 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
             for idx, fut in retry_futures.items():
                 val = fut.result()
                 if not is_refusal(val):
+                    val = sanitize_for_legal(val)
                     if idx == 0: summary = val
                     elif idx == 2: notes = val
                     elif idx == 4: polished_text = val
@@ -1325,6 +1515,15 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
             "models_used": list(set(models_used)),
             "processing_time_seconds": round(elapsed, 1),
             "note_length": note_length,
+            "worker_version": WORKER_VERSION,
+        },
+        "ai_provenance": {
+            "worker_version": WORKER_VERSION,
+            "primary_model": primary_model,
+            "models_used": list(set(models_used)),
+            "processing_time_seconds": round(elapsed, 1),
+            "plain_text_sanitized": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         },
     }
 
@@ -1477,6 +1676,7 @@ def run_pipeline(record):
         # Extract non-column fields before saving
         speakers_info = insights.pop("speakers_info", [])
         ai_model_info = insights.pop("ai_model_info", {})
+        ai_provenance = insights.pop("ai_provenance", {})
 
         # If Deepgram was used and provided real speaker diarization, prefer those speakers
         # over the LLM-guessed ones (LLM speakers_info still useful for names/roles)
@@ -1496,6 +1696,7 @@ def run_pipeline(record):
                 "speakers_info": speakers_info,
                 "ai_model_info": ai_model_info,
             },
+            "ai_provenance": ai_provenance,
             **insights,
         })
 
@@ -1524,11 +1725,12 @@ def run_pipeline(record):
         # ── Extract facts, entities, quotes, timeline, contradictions (async) ──
         import threading as _th
         def _post_pipeline():
-            extract_facts_and_entities(analysis_id, user_id, title, polished, description)
+            _src = (raw_data or {}).get("source", "unknown")
+            extract_facts_and_entities(analysis_id, user_id, title, polished, description, source_type=_src)
             extract_quotes_and_timeline(analysis_id, user_id, title, polished, description)
             detect_contradictions(analysis_id, user_id, title, polished)
             log_custody(analysis_id, "enrichment_complete", {
-                "enrichments": ["facts", "entities", "quotes", "timeline", "contradictions"],
+                "enrichments": ["facts", "entities", "legal_entities", "quotes", "timeline", "contradictions"],
             }, user_id=user_id)
             print(f"[worker] Post-pipeline enrichment complete for {analysis_id}")
         _th.Thread(target=_post_pipeline, daemon=True).start()
@@ -1561,8 +1763,9 @@ def save_identified_speakers(user_id, analysis_id, speakers_info):
         print(f"[worker] Speaker save error: {e}")
 
 # ── Fact Extraction ───────────────────────────────────────────────────────────
-def extract_facts_and_entities(analysis_id, user_id, title, transcript, description=""):
+def extract_facts_and_entities(analysis_id, user_id, title, transcript, description="", source_type=None):
     """Extract factual claims and entities from a completed analysis — runs after main pipeline."""
+    _source_type = source_type  # capture for closure in fact row building
     ctx = f'Video title: "{title}"\n' if title else ""
     if description:
         ctx += f'Description: "{description[:500]}"\n'
@@ -1629,6 +1832,16 @@ Be thorough — include every named entity, even if mentioned briefly. Include:
                     if ts_m:
                         ts_seconds = int(ts_m.group(1)) * 60 + int(ts_m.group(2))
 
+                # Map text confidence to numeric score
+                conf_text = f.get("confidence", "medium")
+                conf_score = {"high": 0.85, "medium": 0.55, "low": 0.25}.get(conf_text, 0.5)
+                # Refine with compute_confidence_score
+                conf_score = compute_confidence_score(
+                    f.get("claim", ""),
+                    source_type=_source_type or "unknown",
+                    speaker_identified=bool(f.get("citation")),
+                )
+
                 fact_rows.append({
                     "user_id": user_id,
                     "analysis_id": analysis_id,
@@ -1636,7 +1849,8 @@ Be thorough — include every named entity, even if mentioned briefly. Include:
                     "category": f.get("category", "general"),
                     "source_timestamp": ts_seconds,
                     "citation": f.get("citation", ""),
-                    "confidence": f.get("confidence", "medium"),
+                    "confidence": conf_text,
+                    "confidence_score": conf_score,
                 })
             for i in range(0, len(fact_rows), 50):
                 sb_insert("facts", fact_rows[i:i+50])
@@ -1653,6 +1867,11 @@ Be thorough — include every named entity, even if mentioned briefly. Include:
 
         if raw_entities:
             save_entities(user_id, analysis_id, raw_entities)
+
+        # Legal precision: extract legal entities via regex
+        legal_ents = extract_legal_entities_regex(transcript)
+        if legal_ents:
+            save_legal_entities(user_id, analysis_id, legal_ents)
 
     except Exception as e:
         print(f"[worker] Fact/entity extraction error: {e}")
@@ -2302,6 +2521,7 @@ def handle_reprocess_insights(data):
         insights = generate_insights(transcript, title, user_id=user_id, note_length=note_length)
         speakers_info = insights.pop("speakers_info", [])
         ai_model_info = insights.pop("ai_model_info", {})
+        ai_provenance = insights.pop("ai_provenance", {})
         
         # Merge model info into existing raw_transcript JSON
         raw_rows = sb_get("analyses", {"id": analysis_id}, "raw_transcript")
@@ -2312,6 +2532,7 @@ def handle_reprocess_insights(data):
             "status": "complete",
             "error_message": None,
             "raw_transcript": existing_raw,
+            "ai_provenance": ai_provenance,
             **insights,
         })
         
@@ -2342,7 +2563,8 @@ def handle_export(data):
         speakers_info = raw.get("speakers_info", [])
 
     sections = []
-    sections.append(f"# {a.get('title', 'Untitled Video')}")
+    sections.append(a.get('title', 'Untitled Video').upper())
+    sections.append("=" * len(a.get('title', 'Untitled Video')))
     sections.append(f"Channel: {a.get('channel', 'Unknown')}")
     sections.append(f"URL: {a.get('youtube_url', '')}")
     if a.get("likely_production_date"):
@@ -2353,12 +2575,14 @@ def handle_export(data):
     sections.append("")
 
     # Summary
-    sections.append("## Summary")
-    sections.append(a.get("summary", "N/A"))
+    sections.append("SUMMARY")
+    sections.append("-" * 40)
+    sections.append(sanitize_for_legal(a.get("summary", "N/A")))
     sections.append("")
 
     # Sentiment
-    sections.append("## Sentiment Analysis")
+    sections.append("SENTIMENT ANALYSIS")
+    sections.append("-" * 40)
     sent = a.get("sentiment", {})
     if isinstance(sent, dict):
         sections.append(f"Overall: {sent.get('overall', 'N/A')}")
@@ -2372,22 +2596,25 @@ def handle_export(data):
 
     # Speakers
     if speakers_info:
-        sections.append("## Identified Speakers")
+        sections.append("IDENTIFIED SPEAKERS")
+        sections.append("-" * 40)
         for sp in speakers_info:
             name = sp.get("likely_name") or sp.get("label", "Unknown")
             role = sp.get("role", "")
             pct = sp.get("speaking_percentage", "")
-            sections.append(f"- **{name}**: {role} ({pct}% of dialogue)")
+            sections.append(f"  - {name}: {role} ({pct}% of dialogue)")
         sections.append("")
 
     # Polished Transcript
-    sections.append("## Polished Transcript")
-    sections.append(a.get("polished_transcript", "N/A"))
+    sections.append("POLISHED TRANSCRIPT")
+    sections.append("-" * 40)
+    sections.append(sanitize_for_legal(a.get("polished_transcript", "N/A")))
     sections.append("")
 
     # Speaker Utterances (raw with timestamps)
     if utts:
-        sections.append("## Raw Speaker Transcript (with timestamps)")
+        sections.append("RAW SPEAKER TRANSCRIPT (WITH TIMESTAMPS)")
+        sections.append("-" * 40)
         for u in sorted(utts, key=lambda x: x.get("start_seconds") or 0):
             ts = ""
             if u.get("start_seconds") is not None:
@@ -2399,8 +2626,9 @@ def handle_export(data):
         sections.append("")
 
     # Notes
-    sections.append("## Expanded Notes")
-    sections.append(a.get("expanded_notes", "N/A"))
+    sections.append("EXPANDED NOTES")
+    sections.append("-" * 40)
+    sections.append(sanitize_for_legal(a.get("expanded_notes", "N/A")))
 
     return {"text": "\n".join(sections), "title": a.get("title", "export")}
 

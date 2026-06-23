@@ -81,6 +81,10 @@ function formatSeconds(s: number | null): string {
   return `${m}:${sec.toString().padStart(2, "0")}`;
 }
 
+/**
+ * Strip any residual markdown from text for clean legal display.
+ * v15+: AI outputs are already plain text, but this catches legacy content.
+ */
 function stripMarkdown(text: string): string {
   return text
     .replace(/^#{1,6}\s+/gm, "")
@@ -88,8 +92,9 @@ function stripMarkdown(text: string): string {
     .replace(/\*(.+?)\*/g, "$1")
     .replace(/`(.+?)`/g, "$1")
     .replace(/^>\s+/gm, "")
-    .replace(/^[-*+]\s+/gm, "• ")
-    .replace(/^\d+\.\s+/gm, "");
+    .replace(/^[-*+]\s+/gm, "  - ")
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
 }
 
 function EditableContent({
