@@ -1250,9 +1250,22 @@ def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
             print(f"[call_openai] {GROQ_FALLBACK} also failed: {err_str[:300]}")
 
     error_detail = "; ".join(errors) if errors else "No AI providers configured"
+    configured = []
+    if USE_CEREBRAS: configured.append("Cerebras")
+    if USE_OPENROUTER: configured.append("OpenRouter")
+    if USE_GROQ: configured.append("Groq")
+    provider_note = f" Configured providers: {', '.join(configured) or 'NONE'}."
     if "daily token limit" in error_detail.lower():
-        raise RuntimeError(f"Daily AI token limit reached. Resets at midnight UTC (~6 PM CST). ({error_detail})")
-    raise RuntimeError(f"All AI models failed: {error_detail}")
+        suggestions = []
+        if not USE_CEREBRAS:
+            suggestions.append("Add CEREBRAS_API_KEY (free 1M tokens/day at cerebras.ai)")
+        if not USE_OPENROUTER:
+            suggestions.append("Add OPENROUTER_API_KEY (free models at openrouter.ai)")
+        fix_hint = " Fix: " + "; ".join(suggestions) if suggestions else ""
+        raise RuntimeError(
+            f"Daily AI token limit reached.{provider_note} Resets at midnight UTC (~6 PM CST).{fix_hint}"
+        )
+    raise RuntimeError(f"All AI models failed:{provider_note} {error_detail}")
 
 def get_known_speakers(user_id):
     """Fetch known speakers for this user to help with identification."""
@@ -1415,7 +1428,9 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
 
     # Token limits per call: polished transcript & notes get 16K, others get 4K
     notes_tokens = {"short": 2000, "medium": 8000, "detailed": 16000}.get(note_length, 8000)
-    token_limits = {0: 4000, 1: 2000, 2: notes_tokens, 3: 2000, 4: 16000, 5: 2000}
+    # Token budget per call — reduced where possible to stay within free-tier limits.
+    # Sentiment/date/speakers return tiny JSON; 500 tokens is plenty.
+    token_limits = {0: 3000, 1: 500, 2: notes_tokens, 3: 500, 4: 16000, 5: 1000}
 
     t0 = time.time()
     # Track which model handled each call
@@ -1427,7 +1442,12 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
     elapsed = time.time() - t0
     models_used = [t[0] if t else "unknown" for t in model_trackers]
     primary_model = max(set(models_used), key=models_used.count) if models_used else "unknown"
-    print(f"[worker] 6 OpenAI calls completed in {elapsed:.1f}s (parallel) — models: {models_used}")
+    # Rough token estimate: ~4 chars per token for English text
+    est_input_tokens = sum(len(p[0]) + len(p[1]) for p in prompts) // 4
+    est_output_tokens = sum(len(r) for r in results) // 4
+    est_total_tokens = est_input_tokens + est_output_tokens
+    print(f"[worker] 6 AI calls completed in {elapsed:.1f}s (parallel) — models: {models_used}")
+    print(f"[worker] Estimated tokens: ~{est_input_tokens:,} input + ~{est_output_tokens:,} output = ~{est_total_tokens:,} total")
     summary, sentiment_raw, notes, date_raw, polished_text, speakers_raw = results
 
     # Legal precision: sanitize all text outputs to plain text
@@ -1516,6 +1536,7 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
             "processing_time_seconds": round(elapsed, 1),
             "note_length": note_length,
             "worker_version": WORKER_VERSION,
+            "estimated_tokens": est_total_tokens,
         },
         "ai_provenance": {
             "worker_version": WORKER_VERSION,
@@ -2309,12 +2330,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/test-ai":
             result = {"groq_key_set": bool(GROQ_API_KEY), "groq_key_prefix": GROQ_API_KEY[:8] + "..." if GROQ_API_KEY else "none"}
             try:
-                out = _call_groq("You are a helpful assistant.", "Say 'AI working' in exactly two words.", 20, model=GROQ_MODEL)
+                out = _call_api_once("You are a helpful assistant.", "Say 'AI working' in exactly two words.", 20, model=GROQ_MODEL, provider="groq")
                 result["primary"] = {"status": "ok", "model": GROQ_MODEL, "response": out[:100]}
             except Exception as e:
                 result["primary"] = {"status": "error", "model": GROQ_MODEL, "error": str(e)[:300]}
             try:
-                out2 = _call_groq("You are a helpful assistant.", "Say 'AI working' in exactly two words.", 20, model=GROQ_FALLBACK)
+                out2 = _call_api_once("You are a helpful assistant.", "Say 'AI working' in exactly two words.", 20, model=GROQ_FALLBACK, provider="groq")
                 result["fallback"] = {"status": "ok", "model": GROQ_FALLBACK, "response": out2[:100]}
             except Exception as e:
                 result["fallback"] = {"status": "error", "model": GROQ_FALLBACK, "error": str(e)[:300]}
@@ -2366,12 +2387,30 @@ class Handler(BaseHTTPRequestHandler):
         if USE_GROQ:
             fallbacks.append(f"groq ({GROQ_MODEL})")
         ai_fallback = " → ".join(fallbacks) if fallbacks else "none"
+        providers_detail = []
+        if USE_CEREBRAS:
+            providers_detail.append({"name": "Cerebras", "model": CEREBRAS_MODEL, "daily_limit": "~1M tokens", "configured": True})
+        else:
+            providers_detail.append({"name": "Cerebras", "configured": False, "hint": "Free 1M tokens/day — set CEREBRAS_API_KEY"})
+        if USE_OPENROUTER:
+            providers_detail.append({"name": "OpenRouter", "model": OPENROUTER_MODEL, "daily_limit": "varies by model", "configured": True})
+        else:
+            providers_detail.append({"name": "OpenRouter", "configured": False, "hint": "Free models — set OPENROUTER_API_KEY"})
+        if USE_GROQ:
+            providers_detail.append({"name": "Groq", "model": GROQ_MODEL, "daily_limit": "~100K tokens", "configured": True})
+        else:
+            providers_detail.append({"name": "Groq", "configured": False, "hint": "Free 100K tokens/day — set GROQ_API_KEY"})
+        deepgram_ok = bool(DEEPGRAM_API_KEY)
+        estimated_tokens_per_analysis = "~55K tokens (with optimized limits)"
         self.wfile.write(json.dumps({
             "status": "ok", "version": WORKER_VERSION, "supadata": supadata, "forensic": True,
             "ai_provider": AI_PROVIDER,
             "ai_primary": ai_primary,
             "ai_fallback": ai_fallback,
-        }).encode())
+            "deepgram": deepgram_ok,
+            "providers": providers_detail,
+            "estimated_tokens_per_analysis": estimated_tokens_per_analysis,
+        }, indent=2).encode())
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
