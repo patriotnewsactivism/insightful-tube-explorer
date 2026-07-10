@@ -62,7 +62,7 @@ const STATUS_RANGES: Record<string, [number, number]> = {
   pending:      [0, 8],
   extracting:   [8, 32],
   transcribing: [32, 68],
-  processing:   [68, 94],
+  processing:   [68, 99],
   complete:     [100, 100],
   failed:       [0, 0],
 };
@@ -71,7 +71,7 @@ const STAGE_DURATION: Record<string, number> = {
   pending: 5,
   extracting: 20,
   transcribing: 40,
-  processing: 15,
+  processing: 60,
 };
 
 function formatSeconds(s: number | null): string {
@@ -201,14 +201,17 @@ function NumericalProgressBar({ status }: { status: string }) {
     setProgress((prev) => Math.max(prev, min));
     if (intervalRef.current) clearInterval(intervalRef.current);
     const tickMs = 500;
-    const totalTicks = (duration * 1000) / tickMs;
-    const increment = (max - min) / totalTicks;
     intervalRef.current = setInterval(() => {
       setProgress((prev) => {
         const currentRange = STATUS_RANGES[statusRef.current] ?? [0, 10];
         const ceiling = currentRange[1];
-        const next = prev + increment * (0.5 + Math.random() * 0.8);
-        return Math.min(next, ceiling);
+        const remaining = ceiling - prev;
+        // Asymptotic: always moves, but slows as it approaches ceiling.
+        // Covers ~60% of the gap quickly, then creeps — never stalls.
+        const speed = remaining > 5 ? 0.08 : remaining > 2 ? 0.03 : 0.008;
+        const jitter = 0.7 + Math.random() * 0.6;
+        const next = prev + remaining * speed * jitter;
+        return Math.min(next, ceiling - 0.1);
       });
     }, tickMs);
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
@@ -217,11 +220,40 @@ function NumericalProgressBar({ status }: { status: string }) {
   if (status === "complete" || status === "failed") return null;
 
   const displayPct = Math.round(progress);
+  const [elapsed, setElapsed] = useState(0);
+  const [activityIdx, setActivityIdx] = useState(0);
+  const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (status === "complete" || status === "failed") {
+      if (elapsedRef.current) clearInterval(elapsedRef.current);
+      return;
+    }
+    elapsedRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => { if (elapsedRef.current) clearInterval(elapsedRef.current); };
+  }, [status]);
+
+  useEffect(() => {
+    if (status !== "processing") return;
+    const id = setInterval(() => setActivityIdx((i) => i + 1), 4000);
+    return () => clearInterval(id);
+  }, [status]);
+
+  const processingActivities = [
+    "Generating summary...",
+    "Analyzing sentiment...",
+    "Extracting key insights...",
+    "Identifying speakers...",
+    "Estimating dates...",
+    "Polishing transcript...",
+    "Almost there — wrapping up...",
+  ];
+
   const labels: Record<string, string> = {
     pending: "Queued — waiting for worker...",
     extracting: "Extracting transcript from YouTube...",
     transcribing: "Processing transcript...",
-    processing: "Generating insights with AI...",
+    processing: processingActivities[activityIdx % processingActivities.length],
   };
 
   return (
@@ -231,7 +263,12 @@ function NumericalProgressBar({ status }: { status: string }) {
           <Loader2 className="h-4 w-4 animate-spin text-primary" />
           <span className="text-sm font-medium">{labels[status] ?? "Processing..."}</span>
         </div>
-        <span className="text-2xl font-bold tabular-nums text-primary">{displayPct}%</span>
+        <div className="flex items-center gap-3">
+          {elapsed > 0 && (
+            <span className="text-xs text-muted-foreground tabular-nums">{Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}</span>
+          )}
+          <span className="text-2xl font-bold tabular-nums text-primary">{displayPct}%</span>
+        </div>
       </div>
       <div className="w-full bg-muted rounded-full h-3 overflow-hidden">
         <div

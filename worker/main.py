@@ -1435,8 +1435,8 @@ Look for: names mentioned in conversation, self-references, titles, the video cr
     t0 = time.time()
     # Track which model handled each call
     model_trackers = [[] for _ in prompts]
-    # Run max 2 at a time to stay within Groq free-tier token window (12K tokens)
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    # Run 3 at a time — Cerebras/OpenRouter handle higher concurrency than Groq
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(call_openai, p[0], p[1], token_limits.get(i, 4000), model_trackers[i]) for i, p in enumerate(prompts)]
         results = [f.result() for f in futures]
     elapsed = time.time() - t0
