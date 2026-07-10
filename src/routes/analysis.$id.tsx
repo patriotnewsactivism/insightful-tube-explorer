@@ -233,6 +233,20 @@ function NumericalProgressBar({ status }: { status: string }) {
     return () => { if (elapsedRef.current) clearInterval(elapsedRef.current); };
   }, [status]);
 
+  // ETA: estimate remaining seconds based on progress rate
+  const estimateRemaining = (): string | null => {
+    if (elapsed < 4 || displayPct < 5) return null; // need enough data
+    const pctPerSec = displayPct / elapsed;
+    if (pctPerSec <= 0) return null;
+    const remaining = Math.max(0, Math.ceil((100 - displayPct) / pctPerSec));
+    if (remaining > 600) return null; // don't show wild estimates
+    if (remaining <= 5) return "a few seconds left";
+    if (remaining < 60) return `~${Math.ceil(remaining / 5) * 5}s left`;
+    const m = Math.floor(remaining / 60);
+    const s = Math.ceil((remaining % 60) / 15) * 15;
+    return s > 0 ? `~${m}m ${s}s left` : `~${m}m left`;
+  };
+
   useEffect(() => {
     if (status !== "processing") return;
     const id = setInterval(() => setActivityIdx((i) => i + 1), 4000);
@@ -264,9 +278,14 @@ function NumericalProgressBar({ status }: { status: string }) {
           <span className="text-sm font-medium">{labels[status] ?? "Processing..."}</span>
         </div>
         <div className="flex items-center gap-3">
-          {elapsed > 0 && (
-            <span className="text-xs text-muted-foreground tabular-nums">{Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}</span>
-          )}
+          <div className="flex flex-col items-end">
+            {estimateRemaining() && (
+              <span className="text-xs text-muted-foreground">{estimateRemaining()}</span>
+            )}
+            {elapsed > 0 && (
+              <span className="text-[10px] text-muted-foreground/60 tabular-nums">{Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")} elapsed</span>
+            )}
+          </div>
           <span className="text-2xl font-bold tabular-nums text-primary">{displayPct}%</span>
         </div>
       </div>
