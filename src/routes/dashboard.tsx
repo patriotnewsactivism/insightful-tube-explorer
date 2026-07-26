@@ -82,6 +82,26 @@ function Dashboard() {
   // ── Single URL create ──
   async function createSingle(targetUrl: string, transcript?: string) {
     if (!user) return null;
+
+    // Guard against random/free accounts draining the shared free-tier AI
+    // provider quota (Cerebras/OpenRouter/Groq) that every user's analyses
+    // pull from. Admins are exempt; everyone else gets a rolling 24h cap.
+    const ADMIN_EMAILS = ["don@donmatthews.live", "mreardon@wtpnews.org"];
+    if (!ADMIN_EMAILS.includes(user.email ?? "")) {
+      const FREE_DAILY_CAP = 3;
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const { count, error: countErr } = await supabase
+        .from("analyses")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", user.id)
+        .gte("created_at", since);
+      if (!countErr && (count ?? 0) >= FREE_DAILY_CAP) {
+        throw new Error(
+          `Daily limit reached (${FREE_DAILY_CAP} analyses per 24h on the free tier). Resets on a rolling basis — upgrade for unlimited access.`
+        );
+      }
+    }
+
     const ytId = extractYouTubeId(targetUrl);
     if (!ytId) {
       toast.error(`Invalid YouTube URL: ${targetUrl.slice(0, 60)}`);
@@ -149,6 +169,10 @@ function Dashboard() {
         successCount++;
       } catch (err: any) {
         console.error(`Bulk: failed ${urls[i]}: ${err.message}`);
+        if (err.message?.includes("Daily limit reached")) {
+          toast.error(err.message);
+          break;
+        }
       }
       // Small delay to avoid rate limiting
       if (i < urls.length - 1) await new Promise((r) => setTimeout(r, 300));
