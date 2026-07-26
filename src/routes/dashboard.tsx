@@ -88,17 +88,22 @@ function Dashboard() {
     // pull from. Admins are exempt; everyone else gets a rolling 24h cap.
     const ADMIN_EMAILS = ["don@donmatthews.live", "mreardon@wtpnews.org", "patriotnewsactivism@gmail.com"];
     if (!ADMIN_EMAILS.includes(user.email ?? "")) {
-      const FREE_DAILY_CAP = 3;
-      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      const { count, error: countErr } = await supabase
-        .from("analyses")
-        .select("id", { count: "exact", head: true })
-        .eq("user_id", user.id)
-        .gte("created_at", since);
-      if (!countErr && (count ?? 0) >= FREE_DAILY_CAP) {
-        throw new Error(
-          `Daily limit reached (${FREE_DAILY_CAP} analyses per 24h on the free tier). Resets on a rolling basis — upgrade for unlimited access.`
-        );
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("is_unlimited")
+        .eq("id", user.id)
+        .maybeSingle();
+      if (!profile?.is_unlimited) {
+        const FREE_DAILY_CAP = 3;
+        const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const { count, error: countErr } = await supabase
+          .from("analyses")
+          .select("id", { count: "exact", head: true })
+          .eq("user_id", user.id)
+          .gte("created_at", since);
+        if (!countErr && (count ?? 0) >= FREE_DAILY_CAP) {
+          throw new Error("DAILY_CAP_REACHED");
+        }
       }
     }
 
@@ -140,12 +145,61 @@ function Dashboard() {
       const id = await createSingle(url, transcript);
       if (id) navigate({ to: "/analysis/$id", params: { id } });
     } catch (err: any) {
-      toast.error(err.message ?? "Could not create analysis");
+      if (err.message === "DAILY_CAP_REACHED") {
+        toast.error("Daily limit reached (3 analyses per 24h on the free tier).", {
+          action: { label: "Upgrade — $9/mo", onClick: () => startUpgradeCheckout() },
+        });
+      } else {
+        toast.error(err.message ?? "Could not create analysis");
+      }
     } finally {
       setCreating(false);
       setFetchStatus("idle");
     }
   }
+
+  // ── Stripe upgrade flow ──
+  async function startUpgradeCheckout() {
+    if (!user) return;
+    try {
+      const resp = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId: user.id, origin: window.location.origin }),
+      });
+      const data = await resp.json();
+      if (data.url) window.location.href = data.url;
+      else toast.error(data.error ?? "Could not start checkout");
+    } catch {
+      toast.error("Could not start checkout");
+    }
+  }
+
+  // Handle return from Stripe Checkout (?upgrade=success&session_id=...)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get("session_id");
+    if (params.get("upgrade") === "success" && sessionId && user) {
+      (async () => {
+        try {
+          const resp = await fetch(`/api/confirm-subscription?session_id=${sessionId}`);
+          const data = await resp.json();
+          if (data.paid && data.userId === user.id) {
+            await supabase.from("profiles").update({ is_unlimited: true }).eq("id", user.id);
+            toast.success("You're upgraded! Unlimited analyses unlocked.");
+          } else {
+            toast.error("Could not confirm payment — contact support if you were charged.");
+          }
+        } catch {
+          toast.error("Could not confirm payment — contact support if you were charged.");
+        } finally {
+          window.history.replaceState({}, "", window.location.pathname);
+        }
+      })();
+    } else if (params.get("upgrade") === "cancelled") {
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+  }, [user]);
 
   // ── Bulk create ──
   async function onCreateBulk(e: React.FormEvent) {
@@ -169,8 +223,10 @@ function Dashboard() {
         successCount++;
       } catch (err: any) {
         console.error(`Bulk: failed ${urls[i]}: ${err.message}`);
-        if (err.message?.includes("Daily limit reached")) {
-          toast.error(err.message);
+        if (err.message === "DAILY_CAP_REACHED") {
+          toast.error("Daily limit reached (3 analyses per 24h on the free tier).", {
+            action: { label: "Upgrade — $9/mo", onClick: () => startUpgradeCheckout() },
+          });
           break;
         }
       }
