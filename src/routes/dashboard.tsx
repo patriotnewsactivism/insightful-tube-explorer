@@ -86,7 +86,7 @@ function Dashboard() {
     // Guard against random/free accounts draining the shared free-tier AI
     // provider quota (Cerebras/OpenRouter/Groq) that every user's analyses
     // pull from. Admins are exempt; everyone else gets a rolling 24h cap.
-    const ADMIN_EMAILS = ["don@donmatthews.live", "mreardon@wtpnews.org"];
+    const ADMIN_EMAILS = ["don@donmatthews.live", "mreardon@wtpnews.org", "patriotnewsactivism@gmail.com"];
     if (!ADMIN_EMAILS.includes(user.email ?? "")) {
       const FREE_DAILY_CAP = 3;
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();

@@ -21,7 +21,7 @@ DECLARE
   v_cap CONSTANT INT := 3;
 BEGIN
   SELECT email INTO v_email FROM auth.users WHERE id = NEW.user_id;
-  IF v_email IN ('don@donmatthews.live', 'mreardon@wtpnews.org') THEN
+  IF v_email IN ('don@donmatthews.live', 'mreardon@wtpnews.org', 'patriotnewsactivism@gmail.com') THEN
     RETURN NEW;
   END IF;
 
