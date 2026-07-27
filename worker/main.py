@@ -1,5 +1,5 @@
 """
-TubeScribe: Audio Worker v14
+TubeScribe: Audio Worker v16
 Pipeline: Pasted transcript → Deepgram Nova-2 (audio) → Supadata API → YouTube captions fallback
          → AI insights (parallel)
 
@@ -12,9 +12,12 @@ v12: Cerebras support (1M tokens/day free), optimized prompt sizes, robust rate 
 v13: Deepgram Nova-2 as primary transcription (real audio, not captions); fixed raw/polished labeling
 v14: Forensic evidence foundation — SHA-256 hash chain, chain of custody log, raw transcript
      preservation, forensic export, hash verification endpoint
+v15: Legal precision batch 1 — plain-text sanitizer, confidence scoring, legal entity extraction
+v16: Multi-provider quality-first routing — Qwen (qwen-max) → Mistral → Cerebras → Groq fallback
+     chain with graceful degradation; env-driven base URLs for all providers
 """
 
-import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod
+import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod, threading
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlencode
 from urllib.request import urlopen, Request, build_opener, HTTPCookieProcessor
@@ -26,9 +29,9 @@ from concurrent.futures import ThreadPoolExecutor
 # ── Env vars ────────────────────────────────────────────────────────────────
 SUPABASE_URL             = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE    = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-# ── AI provider config (Cerebras preferred: 1M tokens/day free) ─────────────
+# ── AI provider config (Cerebras: 1M tokens/day free, gpt-oss-120b) ──────────
 CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
-CEREBRAS_MODEL   = os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")
+CEREBRAS_MODEL   = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")
 # ── OpenRouter (free tier: 27 free models, Google login) ───────────────────
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b:free")
@@ -36,12 +39,49 @@ OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b:fre
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL       = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FALLBACK    = os.environ.get("GROQ_FALLBACK_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+# ── Qwen (Alibaba MaaS token-plan, ap-southeast-1) ─────────────────────────
+# Reads QWENCLOUD_API_KEY (user's var name) or QWEN_API_KEY.
+# Regional endpoint serves next-gen Qwen3 reasoning models (qwen3.8-max-preview).
+QWEN_API_KEY     = os.environ.get("QWENCLOUD_API_KEY", "") or os.environ.get("QWEN_API_KEY", "")
+QWEN_MODEL       = os.environ.get("QWEN_MODEL", "qwen3.8-max-preview")
+QWEN_BASE_URL    = os.environ.get("QWEN_BASE_URL", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions")
+# ── Mistral (api.mistral.ai — high quality, generous limits) ───────────────
+MISTRAL_API_KEY  = os.environ.get("MISTRAL_API_KEY", "")
+MISTRAL_MODEL    = os.environ.get("MISTRAL_MODEL", "mistral-large-latest")
+MISTRAL_BASE_URL = os.environ.get("MISTRAL_BASE_URL", "https://api.mistral.ai/v1/chat/completions")
+# ── Poolside (env-gated — set POOLSIDE_BASE_URL to enable) ─────────────────
+POOLSIDE_API_KEY  = os.environ.get("POOLSIDE_API_KEY", "")
+POOLSIDE_MODEL    = os.environ.get("POOLSIDE_MODEL", "poolside-1")
+POOLSIDE_BASE_URL = os.environ.get("POOLSIDE_BASE_URL", "")
 USE_GROQ         = bool(GROQ_API_KEY)
 USE_CEREBRAS     = bool(CEREBRAS_API_KEY)
 USE_OPENROUTER   = bool(OPENROUTER_API_KEY)
-# Which provider to try first
-AI_PROVIDER      = "cerebras" if USE_CEREBRAS else ("openrouter" if USE_OPENROUTER else "groq")
+USE_QWEN         = bool(QWEN_API_KEY)
+USE_MISTRAL      = bool(MISTRAL_API_KEY)
+# Poolside requires BOTH a key and a base URL (no known public default endpoint)
+USE_POOLSIDE     = bool(POOLSIDE_API_KEY and POOLSIDE_BASE_URL)
+# Which provider to try first (used for the legacy health-endpoint report)
+AI_PROVIDER      = ("qwen" if USE_QWEN else
+                    "mistral" if USE_MISTRAL else
+                    "cerebras" if USE_CEREBRAS else
+                    "openrouter" if USE_OPENROUTER else
+                    "groq")
 SUPADATA_API_KEY         = os.environ.get("SUPADATA_API_KEY", "")
+# ── Supadata key rotation (multiple keys, auto-rotate on quota exhaustion) ──
+# Keys may be comma-separated in SUPADATA_API_KEY and/or numbered
+# SUPADATA_API_KEY_1, SUPADATA_API_KEY_2, … When a key hits its allotment
+# (HTTP 429/402 or a quota/error message), it is parked for a 1h cooldown and
+# the next key is used automatically.
+_sd_keys = [k.strip() for k in SUPADATA_API_KEY.split(",") if k.strip()] if SUPADATA_API_KEY else []
+_sd_n = 1
+while os.environ.get(f"SUPADATA_API_KEY_{_sd_n}"):
+    _sd_k = os.environ[f"SUPADATA_API_KEY_{_sd_n}"].strip()
+    if _sd_k and _sd_k not in _sd_keys:
+        _sd_keys.append(_sd_k)
+    _sd_n += 1
+SUPADATA_KEYS = _sd_keys               # unique keys (list; empty = not configured)
+_supadata_exhausted = {}               # {key: expiry_unix_ts} — parked keys
+_supadata_lock = threading.Lock()
 DEEPGRAM_API_KEY         = os.environ.get("DEEPGRAM_API_KEY", "")
 PORT                     = int(os.environ.get("PORT", 8080))
 
@@ -92,7 +132,7 @@ def sb_insert(table, rows):
     except HTTPError as e:
         print(f"[sb_insert] {e.status}: {e.read()}")
 
-WORKER_VERSION = "v15"
+WORKER_VERSION = "v16"
 
 # ── Legal Precision: Plain-Text Sanitizer ────────────────────────────────────
 
@@ -521,12 +561,46 @@ def extract_video_id(url):
             return m.group(1)
     return None
 
-# ── Supadata API (primary transcript source) ─────────────────────────────────
-def _supadata_curl(url):
-    """Call Supadata API via curl to bypass Cloudflare bot detection on urllib."""
+# ── Supadata API (primary transcript source, with key rotation) ─────────────
+
+def _is_supadata_quota_exhausted(http_status, data):
+    """Detect whether a Supadata response signals quota/allotment exhaustion."""
+    if http_status in (429, 402):
+        return True
+    if not isinstance(data, dict):
+        return False
+    err_bits = []
+    for field in ("error", "message", "detail"):
+        v = data.get(field)
+        if isinstance(v, str):
+            err_bits.append(v.lower())
+        elif isinstance(v, dict):
+            err_bits.append((v.get("message", "") + " " + str(v.get("code", ""))).lower())
+        elif isinstance(v, list):
+            err_bits.append(" ".join(str(e) for e in v).lower())
+    blob = " ".join(err_bits)
+    quota_terms = ("quota", "rate limit", "limit exceeded", "exceeded", "allotment",
+                   "usage limit", "monthly", "too many requests", "credits",
+                   "insufficient", "plan limit")
+    return any(term in blob for term in quota_terms)
+
+
+def _supadata_active_key():
+    """Return (key, index) of the first non-exhausted Supadata key, or (None, -1)."""
+    now = time.time()
+    for idx, key in enumerate(SUPADATA_KEYS):
+        exp = _supadata_exhausted.get(key)
+        if exp is None or exp <= now:
+            return key, idx
+    return None, -1
+
+
+def _supadata_request(url, key):
+    """Single Supadata curl call with one key. Returns (data, http_status, exhausted)."""
     cmd = [
         "curl", "-s", "-m", "30",
-        "-H", f"x-api-key: {SUPADATA_API_KEY}",
+        "-w", "\n__HTTP__%{http_code}",
+        "-H", f"x-api-key: {key}",
         "-H", "Accept: application/json",
         "-H", "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         url,
@@ -534,28 +608,211 @@ def _supadata_curl(url):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
         if result.returncode != 0:
-            print(f"[worker] Supadata curl failed (rc={result.returncode}): {result.stderr[:200]}")
-            return None
-        body = result.stdout.strip()
+            print(f"[supadata] curl failed (rc={result.returncode}): {result.stderr[:200]}")
+            return None, 0, False
+        output = result.stdout.strip()
+        if not output:
+            return None, 0, False
+        body, _, status_str = output.rpartition("__HTTP__")
+        body = body.strip()
+        http_status = int(status_str.strip()) if status_str.strip().isdigit() else 0
         if not body:
-            print("[worker] Supadata curl returned empty body")
-            return None
-        return json.loads(body)
+            return None, http_status, False
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            print(f"[supadata] JSON error: {e}, body: {body[:200]}")
+            return None, http_status, False
+        return data, http_status, _is_supadata_quota_exhausted(http_status, data)
     except subprocess.TimeoutExpired:
-        print("[worker] Supadata curl timed out")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"[worker] Supadata curl JSON error: {e}, body: {result.stdout[:200]}")
-        return None
+        print("[supadata] curl timed out")
+        return None, 0, False
     except Exception as e:
-        print(f"[worker] Supadata curl exception: {e}")
+        print(f"[supadata] curl exception: {e}")
+        return None, 0, False
+
+
+def _supadata_curl(url):
+    """Call Supadata API via curl with automatic key rotation on quota exhaustion.
+
+    Cloudflare blocks urllib, so we use curl. Tries the active key; if the
+    response signals allotment exhaustion, parks that key (1h cooldown), writes
+    telemetry to the supadata_key_status table (for APEX monitoring), and retries
+    with the next key. Returns parsed JSON or None."""
+    if not SUPADATA_KEYS:
         return None
+    for _ in range(len(SUPADATA_KEYS)):
+        with _supadata_lock:
+            key, idx = _supadata_active_key()
+            was_exhausted = key in _supadata_exhausted if key else False
+        if key is None:
+            print("[supadata] All keys exhausted — falling back to captions")
+            return None
+        data, http_status, exhausted = _supadata_request(url, key)
+        if data is not None and not exhausted:
+            if was_exhausted:  # was on cooldown, now recovered — log + clear
+                with _supadata_lock:
+                    _supadata_exhausted.pop(key, None)
+                _log_supadata_key_status(key, recovered=True)
+            return data
+        if exhausted:
+            with _supadata_lock:
+                _supadata_exhausted[key] = time.time() + 3600  # 1h cooldown
+            _log_supadata_key_status(key, exhausted=True, http_status=http_status, data=data)
+            print(f"[supadata] Key #{idx + 1} exhausted (HTTP {http_status}); rotating to next")
+            continue
+        # Non-exhaustion failure (network/parse) — don't penalize the key
+        return data
+    return None
+
+
+# ── Supadata key telemetry (for APEX portfolio monitoring) ───────────────────
+# Writes non-reversible key fingerprints + health state to the
+# supadata_key_status table so APEX can monitor the key pool without holding the
+# actual keys (which live in env vars). Fire-and-forget — telemetry failures
+# never block the transcript pipeline.
+
+def _supadata_key_fingerprint(key):
+    """Return a non-reversible ASCII fingerprint of a Supadata key (last 4 chars).
+    Uses ASCII '...' (not the ellipsis char) so it's URL-safe in Supabase queries."""
+    return f"...{key[-4:]}" if key and len(key) > 4 else "short"
+
+
+def _supadata_check_quota(key):
+    """Call Supadata GET /me to retrieve plan + credit usage. Returns dict or None.
+    Not a billable call, so it works even when the transcript quota is exhausted."""
+    if not key:
+        return None
+    cmd = [
+        "curl", "-s", "-m", "15", "-w", "\n__HTTP__%{http_code}",
+        "-H", f"x-api-key: {key}",
+        "-H", "Accept: application/json",
+        "https://api.supadata.ai/v1/me",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode != 0:
+            return None
+        output = result.stdout.strip()
+        if not output:
+            return None
+        body, _, status_str = output.rpartition("__HTTP__")
+        body = body.strip()
+        http_status = int(status_str.strip()) if status_str.strip().isdigit() else 0
+        if not body:
+            return None
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            return None
+        # Reject error / unauthorized responses (invalid key, etc.)
+        if http_status >= 400 or "error" in data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _log_supadata_key_status(key, exhausted=False, recovered=False, http_status=0, data=None):
+    """Upsert Supadata key telemetry into supadata_key_status (fire-and-forget).
+
+    Stores only a fingerprint — never the full key value. Runs in a daemon
+    thread so it never blocks the transcript pipeline. Also probes GET /me to
+    capture remaining-credits context at the moment of the state change."""
+    def _write():
+        fp = _supadata_key_fingerprint(key)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cooldown_iso = (datetime.now(timezone.utc) + timedelta(seconds=3600)).isoformat()
+        me = _supadata_check_quota(key) if (exhausted or recovered) else None
+        try:
+            existing = sb_get("supadata_key_status", {"key_fingerprint": fp}, "id,exhausted_count")
+            patch = {"worker_version": WORKER_VERSION, "last_checked_at": now_iso}
+            if me:
+                patch["remaining_credits"] = me
+            if exhausted:
+                cur = (existing[0].get("exhausted_count") if existing else 0) or 0
+                patch.update({
+                    "status": "exhausted",
+                    "exhausted_until": cooldown_iso,
+                    "last_exhausted_at": now_iso,
+                    "last_http_status": http_status,
+                    "exhausted_count": cur + 1,
+                })
+                if isinstance(data, dict):
+                    err = data.get("error") or data.get("message") or data.get("detail")
+                    patch["last_error_message"] = str(err)[:300] if err else None
+            elif recovered:
+                patch.update({"status": "active", "exhausted_until": None, "last_used_at": now_iso})
+            if existing:
+                sb_patch("supadata_key_status", {"id": existing[0]["id"]}, patch)
+            else:
+                row = {
+                    "key_fingerprint": fp,
+                    "status": "exhausted" if exhausted else "active",
+                    "worker_version": WORKER_VERSION,
+                    "last_checked_at": now_iso,
+                }
+                if exhausted:
+                    row.update({
+                        "exhausted_until": cooldown_iso,
+                        "last_exhausted_at": now_iso,
+                        "last_http_status": http_status,
+                        "exhausted_count": 1,
+                    })
+                    if isinstance(data, dict):
+                        err = data.get("error") or data.get("message") or data.get("detail")
+                        row["last_error_message"] = str(err)[:300] if err else None
+                if me:
+                    row["remaining_credits"] = me
+                sb_insert("supadata_key_status", [row])
+        except Exception as e:
+            print(f"[supadata] telemetry write error: {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
+def handle_supadata_status():
+    """Live Supadata key-pool health for APEX monitoring (on-demand snapshot).
+    Probes GET /me per key for remaining credits + in-memory exhausted state.
+    Complements the supadata_key_status table (which the pipeline populates on
+    state changes) with a real-time read APEX can hit anytime."""
+    now = time.time()
+    with _supadata_lock:
+        snapshot = list(SUPADATA_KEYS)
+        exhausted_copy = dict(_supadata_exhausted)
+    keys_out = []
+    for idx, key in enumerate(snapshot):
+        exp = exhausted_copy.get(key)
+        if exp and exp > now:
+            status = "exhausted"
+            until_iso = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
+        elif exp:
+            status = "recovering"
+            until_iso = None
+        else:
+            status = "active"
+            until_iso = None
+        me = _supadata_check_quota(key)
+        keys_out.append({
+            "index": idx + 1,
+            "fingerprint": _supadata_key_fingerprint(key),
+            "status": status,
+            "exhausted_until": until_iso,
+            "plan": me.get("plan") if me else None,
+            "me": me,
+        })
+    return {
+        "configured_keys": len(SUPADATA_KEYS),
+        "active_keys": sum(1 for k in keys_out if k["status"] == "active"),
+        "exhausted_keys": sum(1 for k in keys_out if k["status"] == "exhausted"),
+        "recovering_keys": sum(1 for k in keys_out if k["status"] == "recovering"),
+        "keys": keys_out,
+    }
 
 
 def fetch_supadata_transcript(video_id):
     """Fetch transcript via Supadata API — handles YouTube bot detection bypass."""
-    if not SUPADATA_API_KEY:
-        print("[worker] No SUPADATA_API_KEY set, skipping Supadata")
+    if not SUPADATA_KEYS:
+        print("[worker] No Supadata keys configured, skipping")
         return None, None, None
 
     print(f"[worker] Fetching transcript via Supadata API for {video_id}")
@@ -1098,7 +1355,7 @@ CONTENT_FILTER_FALLBACK = "[Content could not be analyzed due to content policy 
 
 
 def _call_api_once(instructions, input_text, max_tokens, model, provider="groq"):
-    """Single API call to Groq, Cerebras, or OpenRouter (no retries)."""
+    """Single API call to any configured provider (all OpenAI-compatible)."""
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
@@ -1110,7 +1367,16 @@ def _call_api_once(instructions, input_text, max_tokens, model, provider="groq")
         "max_tokens": max_tokens,
         "temperature": 0.3,
     }).encode()
-    if provider == "cerebras":
+    if provider == "qwen":
+        url = QWEN_BASE_URL
+        api_key = QWEN_API_KEY
+    elif provider == "mistral":
+        url = MISTRAL_BASE_URL
+        api_key = MISTRAL_API_KEY
+    elif provider == "poolside":
+        url = POOLSIDE_BASE_URL
+        api_key = POOLSIDE_API_KEY
+    elif provider == "cerebras":
         url = "https://api.cerebras.ai/v1/chat/completions"
         api_key = CEREBRAS_API_KEY
     elif provider == "openrouter":
@@ -1176,13 +1442,35 @@ _ai_call_lock = __import__('threading').Lock()
 _ai_last_call = [0.0]  # mutable container for last call timestamp
 
 def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
-    """Route to best available AI: Cerebras → OpenRouter → Groq primary → Groq fallback.
-    Staggers parallel calls to avoid rate limit bursts.
-    If _track_model is a list, appends the name of the model that succeeded."""
-    if not USE_CEREBRAS and not USE_OPENROUTER and not USE_GROQ:
-        raise RuntimeError("No AI API key set — set CEREBRAS_API_KEY, OPENROUTER_API_KEY, or GROQ_API_KEY")
-    # Stagger: Cerebras 0.3s, OpenRouter 0.5s, Groq 1.5s
-    stagger = 0.3 if AI_PROVIDER == "cerebras" else (0.5 if AI_PROVIDER == "openrouter" else 1.5)
+    """Route to the best available AI provider, trying each in quality-priority
+    order with graceful fallback. Staggers parallel calls to avoid rate bursts.
+    If _track_model is a list, appends the name of the model that succeeded.
+
+    Chain (when configured): Qwen → Mistral → Cerebras → OpenRouter →
+    Poolside → Groq → Groq-fallback. The first provider to return content wins;
+    auth/endpoint failures (4xx) fall through to the next provider immediately."""
+    # Build the provider chain: best quality first, known-good fallbacks last.
+    chain = []
+    if USE_QWEN:
+        chain.append(("qwen", QWEN_MODEL))
+    if USE_MISTRAL:
+        chain.append(("mistral", MISTRAL_MODEL))
+    if USE_CEREBRAS:
+        chain.append(("cerebras", CEREBRAS_MODEL))
+    if USE_OPENROUTER:
+        chain.append(("openrouter", OPENROUTER_MODEL))
+    if USE_POOLSIDE:
+        chain.append(("poolside", POOLSIDE_MODEL))
+    if USE_GROQ:
+        chain.append(("groq", GROQ_MODEL))
+        chain.append(("groq", GROQ_FALLBACK))
+
+    if not chain:
+        raise RuntimeError("No AI API key set — set QWENCLOUD_API_KEY, MISTRAL_API_KEY, "
+                           "CEREBRAS_API_KEY, OPENROUTER_API_KEY, or GROQ_API_KEY")
+
+    # Stagger parallel calls to avoid rate-limit bursts (fast providers 0.3s, Groq 1.5s)
+    stagger = 0.3 if AI_PROVIDER not in ("openrouter", "groq") else (0.5 if AI_PROVIDER == "openrouter" else 1.5)
     with _ai_call_lock:
         now = time.time()
         wait_until = _ai_last_call[0] + stagger
@@ -1191,76 +1479,44 @@ def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
         _ai_last_call[0] = time.time()
 
     errors = []
-
-    # Try Cerebras first if available (1M tokens/day free!)
-    if USE_CEREBRAS:
+    for provider, model in chain:
         try:
-            result = _call_with_retries(instructions, input_text, max_tokens, model=CEREBRAS_MODEL, provider="cerebras")
+            result = _call_with_retries(instructions, input_text, max_tokens, model=model, provider=provider)
             if result:
                 if isinstance(_track_model, list):
-                    _track_model.append(f"Cerebras ({CEREBRAS_MODEL})")
+                    _track_model.append(f"{provider} ({model})")
                 return result
-            print(f"[call_openai] Cerebras returned empty, trying next")
-        except Exception as e:
-            errors.append(f"Cerebras: {str(e)[:200]}")
-            print(f"[call_openai] Cerebras failed: {str(e)[:300]}, trying next")
-
-    # Try OpenRouter (free models, generous limits)
-    if USE_OPENROUTER:
-        try:
-            result = _call_with_retries(instructions, input_text, max_tokens, model=OPENROUTER_MODEL, provider="openrouter")
-            if result:
-                if isinstance(_track_model, list):
-                    _track_model.append(f"OpenRouter ({OPENROUTER_MODEL})")
-                return result
-            print(f"[call_openai] OpenRouter returned empty, trying Groq")
-        except Exception as e:
-            errors.append(f"OpenRouter: {str(e)[:200]}")
-            print(f"[call_openai] OpenRouter failed: {str(e)[:300]}, trying Groq")
-
-    # Groq primary
-    if USE_GROQ:
-        try:
-            result = _call_with_retries(instructions, input_text, max_tokens, model=GROQ_MODEL, provider="groq")
-            if result:
-                if isinstance(_track_model, list):
-                    _track_model.append(f"Groq ({GROQ_MODEL})")
-                return result
-            print(f"[call_openai] {GROQ_MODEL} returned empty, trying fallback")
-        except Exception as e:
-            errors.append(f"Groq primary: {str(e)[:200]}")
-            print(f"[call_openai] {GROQ_MODEL} failed: {str(e)[:300]}, trying fallback")
-
-        # Groq fallback
-        try:
-            result = _call_with_retries(instructions, input_text, max_tokens, model=GROQ_FALLBACK, provider="groq")
-            if result:
-                if isinstance(_track_model, list):
-                    _track_model.append(f"Groq ({GROQ_FALLBACK})")
-                return result
-            print(f"[call_openai] {GROQ_FALLBACK} also returned empty")
+            print(f"[call_openai] {provider} returned empty, trying next")
         except Exception as e:
             err_str = str(e)
-            errors.append(f"Groq fallback: {err_str[:200]}")
+            errors.append(f"{provider}: {err_str[:200]}")
+            # Content filter / moderation from ANY provider → safe fallback immediately
             if "content_filter" in err_str.lower() or "moderation" in err_str.lower():
-                print(f"[call_openai] Content filter triggered: {err_str[:300]}")
+                print(f"[call_openai] Content filter triggered ({provider}): {err_str[:300]}")
                 if isinstance(_track_model, list):
                     _track_model.append("content_filter_fallback")
                 return CONTENT_FILTER_FALLBACK
-            print(f"[call_openai] {GROQ_FALLBACK} also failed: {err_str[:300]}")
+            print(f"[call_openai] {provider} failed: {err_str[:300]}, trying next")
 
     error_detail = "; ".join(errors) if errors else "No AI providers configured"
     configured = []
+    if USE_QWEN: configured.append("Qwen")
+    if USE_MISTRAL: configured.append("Mistral")
     if USE_CEREBRAS: configured.append("Cerebras")
     if USE_OPENROUTER: configured.append("OpenRouter")
+    if USE_POOLSIDE: configured.append("Poolside")
     if USE_GROQ: configured.append("Groq")
     provider_note = f" Configured providers: {', '.join(configured) or 'NONE'}."
-    if "daily token limit" in error_detail.lower():
+    if "daily token limit" in error_detail.lower() or "tokens per day" in error_detail.lower():
         suggestions = []
+        if not USE_QWEN:
+            suggestions.append("Add QWENCLOUD_API_KEY (Qwen via Alibaba MaaS — frontier quality, see .env.example)")
+        if not USE_MISTRAL:
+            suggestions.append("Add MISTRAL_API_KEY (free tier at console.mistral.ai)")
         if not USE_CEREBRAS:
-            suggestions.append("Add CEREBRAS_API_KEY (free 1M tokens/day at cerebras.ai)")
-        if not USE_OPENROUTER:
-            suggestions.append("Add OPENROUTER_API_KEY (free models at openrouter.ai)")
+            suggestions.append("Add CEREBRAS_API_KEY (gpt-oss-120b at cerebras.ai)")
+        if not USE_GROQ:
+            suggestions.append("Add GROQ_API_KEY (free 100K tokens/day at groq.com)")
         fix_hint = " Fix: " + "; ".join(suggestions) if suggestions else ""
         raise RuntimeError(
             f"Daily AI token limit reached.{provider_note} Resets at midnight UTC (~6 PM CST).{fix_hint}"
@@ -1670,7 +1926,7 @@ def run_pipeline(record):
 
             # ── TRACK 4: Fail ──
             if utterances is None:
-                if SUPADATA_API_KEY or DEEPGRAM_API_KEY:
+                if SUPADATA_KEYS or DEEPGRAM_API_KEY:
                     fail_analysis(analysis_id,
                         "Could not extract transcript. Audio download may have failed and "
                         "no captions are available. Try the 'Paste transcript' option.")
@@ -2368,36 +2624,54 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(results, indent=2).encode())
             return
-        supadata = "yes" if SUPADATA_API_KEY else "no"
+        # ── Supadata key-pool health (live snapshot for APEX monitoring) ──
+        if path == "/supadata-status":
+            result = handle_supadata_status()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result, indent=2).encode())
+            return
+        supadata = f"{len(SUPADATA_KEYS)} keys" if SUPADATA_KEYS else "no"
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self._cors_headers()
         self.end_headers()
-        if USE_CEREBRAS:
-            ai_primary = f"cerebras ({CEREBRAS_MODEL})"
-        elif USE_OPENROUTER:
-            ai_primary = f"openrouter ({OPENROUTER_MODEL})"
-        elif USE_GROQ:
-            ai_primary = f"groq ({GROQ_MODEL})"
-        else:
-            ai_primary = "none"
-        fallbacks = []
-        if USE_OPENROUTER and AI_PROVIDER != "openrouter":
-            fallbacks.append(f"openrouter ({OPENROUTER_MODEL})")
-        if USE_GROQ:
-            fallbacks.append(f"groq ({GROQ_MODEL})")
-        ai_fallback = " → ".join(fallbacks) if fallbacks else "none"
+        # Report the full provider chain in quality-priority order
+        _chain_parts = []
+        if USE_QWEN:     _chain_parts.append(f"qwen ({QWEN_MODEL})")
+        if USE_MISTRAL:  _chain_parts.append(f"mistral ({MISTRAL_MODEL})")
+        if USE_CEREBRAS: _chain_parts.append(f"cerebras ({CEREBRAS_MODEL})")
+        if USE_OPENROUTER: _chain_parts.append(f"openrouter ({OPENROUTER_MODEL})")
+        if USE_POOLSIDE: _chain_parts.append(f"poolside ({POOLSIDE_MODEL})")
+        if USE_GROQ:     _chain_parts.append(f"groq ({GROQ_MODEL}/{GROQ_FALLBACK})")
+        ai_chain = " → ".join(_chain_parts) if _chain_parts else "none"
+        ai_primary = _chain_parts[0] if _chain_parts else "none"
+        ai_fallback = " → ".join(_chain_parts[1:]) if len(_chain_parts) > 1 else "none"
         providers_detail = []
-        if USE_CEREBRAS:
-            providers_detail.append({"name": "Cerebras", "model": CEREBRAS_MODEL, "daily_limit": "~1M tokens", "configured": True})
+        if USE_QWEN:
+            providers_detail.append({"name": "Qwen", "model": QWEN_MODEL, "configured": True})
         else:
-            providers_detail.append({"name": "Cerebras", "configured": False, "hint": "Free 1M tokens/day — set CEREBRAS_API_KEY"})
+            providers_detail.append({"name": "Qwen", "configured": False, "hint": "Set QWENCLOUD_API_KEY — frontier quality (see .env.example)"})
+        if USE_MISTRAL:
+            providers_detail.append({"name": "Mistral", "model": MISTRAL_MODEL, "configured": True})
+        else:
+            providers_detail.append({"name": "Mistral", "configured": False, "hint": "Set MISTRAL_API_KEY (console.mistral.ai)"})
+        if USE_CEREBRAS:
+            providers_detail.append({"name": "Cerebras", "model": CEREBRAS_MODEL, "configured": True})
+        else:
+            providers_detail.append({"name": "Cerebras", "configured": False, "hint": "gpt-oss-120b — set CEREBRAS_API_KEY (cerebras.ai)"})
         if USE_OPENROUTER:
-            providers_detail.append({"name": "OpenRouter", "model": OPENROUTER_MODEL, "daily_limit": "varies by model", "configured": True})
+            providers_detail.append({"name": "OpenRouter", "model": OPENROUTER_MODEL, "configured": True})
         else:
             providers_detail.append({"name": "OpenRouter", "configured": False, "hint": "Free models — set OPENROUTER_API_KEY"})
+        if USE_POOLSIDE:
+            providers_detail.append({"name": "Poolside", "model": POOLSIDE_MODEL, "configured": True})
+        else:
+            providers_detail.append({"name": "Poolside", "configured": False, "hint": "Set POOLSIDE_API_KEY + POOLSIDE_BASE_URL"})
         if USE_GROQ:
-            providers_detail.append({"name": "Groq", "model": GROQ_MODEL, "daily_limit": "~100K tokens", "configured": True})
+            providers_detail.append({"name": "Groq", "model": GROQ_MODEL, "configured": True})
         else:
             providers_detail.append({"name": "Groq", "configured": False, "hint": "Free 100K tokens/day — set GROQ_API_KEY"})
         deepgram_ok = bool(DEEPGRAM_API_KEY)
@@ -2407,6 +2681,7 @@ class Handler(BaseHTTPRequestHandler):
             "ai_provider": AI_PROVIDER,
             "ai_primary": ai_primary,
             "ai_fallback": ai_fallback,
+            "ai_chain": ai_chain,
             "deepgram": deepgram_ok,
             "providers": providers_detail,
             "estimated_tokens_per_analysis": estimated_tokens_per_analysis,
@@ -2672,6 +2947,17 @@ def handle_export(data):
     return {"text": "\n".join(sections), "title": a.get("title", "export")}
 
 if __name__ == "__main__":
-    print(f"[worker] {WORKER_VERSION} — Supadata: {'enabled' if SUPADATA_API_KEY else 'not configured'} | Forensic: enabled")
+    _parts = []
+    if USE_QWEN:     _parts.append(f"Qwen({QWEN_MODEL})")
+    if USE_MISTRAL:  _parts.append(f"Mistral({MISTRAL_MODEL})")
+    if USE_CEREBRAS: _parts.append(f"Cerebras({CEREBRAS_MODEL})")
+    if USE_OPENROUTER: _parts.append(f"OpenRouter({OPENROUTER_MODEL})")
+    if USE_POOLSIDE: _parts.append(f"Poolside({POOLSIDE_MODEL})")
+    if USE_GROQ:     _parts.append(f"Groq({GROQ_MODEL})")
+    ai_chain = " → ".join(_parts) if _parts else "none"
+    print(f"[worker] {WORKER_VERSION} — Supadata: {len(SUPADATA_KEYS)} key(s) | Forensic: enabled")
+    print(f"[worker] AI chain: {ai_chain}")
+    if POOLSIDE_API_KEY and not POOLSIDE_BASE_URL:
+        print("[worker] NOTE: POOLSIDE_API_KEY set but POOLSIDE_BASE_URL missing — Poolside disabled. Set POOLSIDE_BASE_URL to enable.")
     print(f"[worker] Listening on port {PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
