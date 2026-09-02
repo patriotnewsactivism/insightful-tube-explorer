@@ -9,9 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
 
-export const Route = createFileRoute("/auth")(
-  { component: AuthPage }
-);
+export const Route = createFileRoute("/auth")({ component: AuthPage });
 
 function AuthPage() {
   const { user, loading } = useAuth();
@@ -20,6 +18,7 @@ function AuthPage() {
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
+  const googleAuthEnabled = import.meta.env.VITE_GOOGLE_AUTH_ENABLED === "true";
 
   useEffect(() => {
     if (!loading && user) navigate({ to: "/dashboard" });
@@ -55,9 +54,7 @@ function AuthPage() {
     setBusy(true);
     const { error } = await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: {
-        redirectTo: window.location.origin + "/dashboard",
-      },
+      options: { redirectTo: window.location.origin + "/dashboard" },
     });
     if (error) {
       setBusy(false);
@@ -115,13 +112,17 @@ function AuthPage() {
               </form>
             </TabsContent>
           </Tabs>
-          <div className="relative my-6">
-            <div className="absolute inset-0 flex items-center"><span className="w-full border-t border-border" /></div>
-            <div className="relative flex justify-center text-xs"><span className="bg-surface px-2 text-muted-foreground">or</span></div>
-          </div>
-          <Button variant="outline" className="w-full" onClick={onGoogle} disabled={busy}>
-            Continue with Google
-          </Button>
+          {googleAuthEnabled && (
+            <>
+              <div className="relative my-6">
+                <div className="absolute inset-0 flex items-center"><span className="w-full border-t border-border" /></div>
+                <div className="relative flex justify-center text-xs"><span className="bg-surface px-2 text-muted-foreground">or</span></div>
+              </div>
+              <Button variant="outline" className="w-full" onClick={onGoogle} disabled={busy}>
+                Continue with Google
+              </Button>
+            </>
+          )}
         </div>
       </main>
     </div>
