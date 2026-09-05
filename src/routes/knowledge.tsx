@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-const WORKER_URL = import.meta.env.VITE_WORKER_URL || "https://insightful-tube-explorer-production.up.railway.app";
+const WORKER_URL = import.meta.env.VITE_WORKER_URL || "https://tubescribe-backend-production.up.railway.app";
 
 export const Route = createFileRoute("/knowledge")({
   component: KnowledgeBase,

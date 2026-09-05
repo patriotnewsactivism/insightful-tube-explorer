@@ -10,7 +10,7 @@ import {
 
 const WORKER_URL =
   import.meta.env.VITE_WORKER_URL ||
-  "https://insightful-tube-explorer-production.up.railway.app";
+  "https://tubescribe-backend-production.up.railway.app";
 
 type EvidenceBadgeProps = {
   analysisId: string;

@@ -19,7 +19,7 @@ export const Route = createFileRoute("/analysis/$id")({
   component: AnalysisPage,
 });
 
-const WORKER_URL = import.meta.env.VITE_WORKER_URL || "https://insightful-tube-explorer-production.up.railway.app";
+const WORKER_URL = import.meta.env.VITE_WORKER_URL || "https://tubescribe-backend-production.up.railway.app";
 
 type Analysis = {
   id: string;
