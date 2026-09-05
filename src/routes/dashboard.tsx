@@ -18,6 +18,8 @@ export const Route = createFileRoute("/dashboard")({
   component: Dashboard,
 });
 
+const WORKER_URL = import.meta.env.VITE_WORKER_URL || "https://tubescribe-backend-production.up.railway.app";
+
 type Analysis = {
   id: string;
   youtube_url: string;
@@ -147,7 +149,7 @@ function Dashboard() {
     } catch (err: any) {
       if (err.message === "DAILY_CAP_REACHED") {
         toast.error("Daily limit reached (3 analyses per 24h on the free tier).", {
-          action: { label: "Upgrade — $9/mo", onClick: () => startUpgradeCheckout() },
+          action: { label: "Upgrade", onClick: () => setShowPricing(true) },
         });
       } else {
         toast.error(err.message ?? "Could not create analysis");
@@ -158,20 +160,26 @@ function Dashboard() {
     }
   }
 
-  // ── Stripe upgrade flow ──
-  async function startUpgradeCheckout() {
+  // ── Stripe upgrade flow (monthly / yearly / lifetime) ──
+  const [showPricing, setShowPricing] = useState(false);
+  const [checkoutLoading, setCheckoutLoading] = useState<string | null>(null);
+
+  async function startUpgradeCheckout(plan: "monthly" | "yearly" | "lifetime") {
     if (!user) return;
+    setCheckoutLoading(plan);
     try {
-      const resp = await fetch("/api/create-checkout-session", {
+      const resp = await fetch(`${WORKER_URL}/stripe/checkout-session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId: user.id, origin: window.location.origin }),
+        body: JSON.stringify({ plan, userId: user.id, origin: window.location.origin }),
       });
       const data = await resp.json();
       if (data.url) window.location.href = data.url;
       else toast.error(data.error ?? "Could not start checkout");
     } catch {
       toast.error("Could not start checkout");
+    } finally {
+      setCheckoutLoading(null);
     }
   }
 
@@ -182,7 +190,7 @@ function Dashboard() {
     if (params.get("upgrade") === "success" && sessionId && user) {
       (async () => {
         try {
-          const resp = await fetch(`/api/confirm-subscription?session_id=${sessionId}`);
+          const resp = await fetch(`${WORKER_URL}/stripe/confirm?session_id=${sessionId}`);
           const data = await resp.json();
           if (data.paid && data.userId === user.id) {
             await supabase.from("profiles").update({ is_unlimited: true }).eq("id", user.id);
@@ -225,7 +233,7 @@ function Dashboard() {
         console.error(`Bulk: failed ${urls[i]}: ${err.message}`);
         if (err.message === "DAILY_CAP_REACHED") {
           toast.error("Daily limit reached (3 analyses per 24h on the free tier).", {
-            action: { label: "Upgrade — $9/mo", onClick: () => startUpgradeCheckout() },
+            action: { label: "Upgrade", onClick: () => setShowPricing(true) },
           });
           break;
         }
@@ -538,6 +546,66 @@ function Dashboard() {
           </div>
         )}
       </main>
+
+      {showPricing && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setShowPricing(false)}
+        >
+          <div
+            className="w-full max-w-3xl rounded-lg border bg-card p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: "min(100%, 768px)" }}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold">TubeScribe Pro — Unlimited Analyses</h2>
+              <button
+                className="text-muted-foreground hover:text-foreground"
+                onClick={() => setShowPricing(false)}
+                aria-label="Close"
+              >
+                <XCircle className="h-5 w-5" />
+              </button>
+            </div>
+            <p className="text-sm text-muted-foreground mb-5">
+              The free tier includes 3 analyses per 24 hours. Pro removes the cap — every feature,
+              unlimited videos, no surprises.
+            </p>
+            <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(100%, 1fr))" }}>
+              {([
+                { id: "monthly", name: "Monthly", price: "$9", per: "/month", note: "Cancel anytime" },
+                { id: "yearly", name: "Yearly", price: "$79", per: "/year", note: "Save over 2 months vs monthly" },
+                { id: "lifetime", name: "Lifetime", price: "$199", per: "once", note: "Best value — pay once, Pro forever" },
+              ] as const).map((plan) => (
+                <button
+                  key={plan.id}
+                  onClick={() => startUpgradeCheckout(plan.id)}
+                  disabled={checkoutLoading !== null}
+                  className="flex items-center justify-between rounded-lg border p-4 text-left transition-colors hover:bg-accent disabled:opacity-60"
+                >
+                  <div>
+                    <div className="font-medium">{plan.name}</div>
+                    <div className="text-xs text-muted-foreground">{plan.note}</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-lg font-semibold">{plan.price}</span>
+                    <span className="text-xs text-muted-foreground">{plan.per}</span>
+                    {checkoutLoading === plan.id ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Zap className="h-4 w-4" />
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+            <p className="mt-4 text-xs text-muted-foreground">
+              Secure checkout via Stripe. Yearly and monthly plans renew automatically and can be cancelled
+              anytime; the Lifetime plan is a one-time payment.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

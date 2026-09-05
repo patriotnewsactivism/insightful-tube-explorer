@@ -13,8 +13,11 @@ v13: Deepgram Nova-2 as primary transcription (real audio, not captions); fixed 
 v14: Forensic evidence foundation — SHA-256 hash chain, chain of custody log, raw transcript
      preservation, forensic export, hash verification endpoint
 v15: Legal precision batch 1 — plain-text sanitizer, confidence scoring, legal entity extraction
-v16: Multi-provider quality-first routing — Qwen (qwen-max) → Mistral → Cerebras → Groq fallback
-     chain with graceful degradation; env-driven base URLs for all providers
+v16: Multi-provider quality-first routing with graceful degradation
+v17: Cleanup — dead providers (Qwen, Poolside) removed; chain is now Mistral →
+     Cerebras → OpenRouter (free) → Groq. Added: pending-analysis poller (works
+     even with no Supabase webhook), Stripe checkout/confirm/webhook endpoints
+     (monthly/yearly/lifetime plans), admin /status diagnostics.
 """
 
 import os, json, time, hmac, hashlib, base64, tempfile, subprocess, re, uuid, io, html as html_mod, threading
@@ -39,29 +42,16 @@ OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b:fre
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL       = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FALLBACK    = os.environ.get("GROQ_FALLBACK_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
-# ── Qwen (Alibaba MaaS token-plan, ap-southeast-1) ─────────────────────────
-# Reads QWENCLOUD_API_KEY (user's var name) or QWEN_API_KEY.
-# Regional endpoint serves next-gen Qwen3 reasoning models (qwen3.8-max-preview).
-QWEN_API_KEY     = os.environ.get("QWENCLOUD_API_KEY", "") or os.environ.get("QWEN_API_KEY", "")
-QWEN_MODEL       = os.environ.get("QWEN_MODEL", "qwen3.8-max-preview")
-QWEN_BASE_URL    = os.environ.get("QWEN_BASE_URL", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions")
 # ── Mistral (api.mistral.ai — high quality, generous limits) ───────────────
 MISTRAL_API_KEY  = os.environ.get("MISTRAL_API_KEY", "")
 MISTRAL_MODEL    = os.environ.get("MISTRAL_MODEL", "mistral-large-latest")
 MISTRAL_BASE_URL = os.environ.get("MISTRAL_BASE_URL", "https://api.mistral.ai/v1/chat/completions")
-# ── Poolside (env-gated — set POOLSIDE_BASE_URL to enable) ─────────────────
-POOLSIDE_API_KEY  = os.environ.get("POOLSIDE_API_KEY", "")
-POOLSIDE_MODEL    = os.environ.get("POOLSIDE_MODEL", "poolside-1")
-POOLSIDE_BASE_URL = os.environ.get("POOLSIDE_BASE_URL", "")
 USE_GROQ         = bool(GROQ_API_KEY)
 USE_CEREBRAS     = bool(CEREBRAS_API_KEY)
 USE_OPENROUTER   = bool(OPENROUTER_API_KEY)
-USE_QWEN         = bool(QWEN_API_KEY)
 USE_MISTRAL      = bool(MISTRAL_API_KEY)
-# Poolside requires BOTH a key and a base URL (no known public default endpoint)
-USE_POOLSIDE     = bool(POOLSIDE_API_KEY and POOLSIDE_BASE_URL)
 # Which provider to try first (used for the legacy health-endpoint report)
-AI_PROVIDER      = ("qwen" if USE_QWEN else
+AI_PROVIDER      = ("mistral" if USE_MISTRAL else
                     "mistral" if USE_MISTRAL else
                     "cerebras" if USE_CEREBRAS else
                     "openrouter" if USE_OPENROUTER else
@@ -83,6 +73,12 @@ SUPADATA_KEYS = _sd_keys               # unique keys (list; empty = not configur
 _supadata_exhausted = {}               # {key: expiry_unix_ts} — parked keys
 _supadata_lock = threading.Lock()
 DEEPGRAM_API_KEY         = os.environ.get("DEEPGRAM_API_KEY", "")
+# ── Stripe monetization (monthly / yearly / lifetime) ────────────────────────
+STRIPE_SECRET_KEY    = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_MONTHLY  = os.environ.get("STRIPE_PRICE_MONTHLY",  "price_1UCA59LqbDDXxFmBPnbI3yz9")  # $9/mo
+STRIPE_PRICE_YEARLY   = os.environ.get("STRIPE_PRICE_YEARLY",   "price_1UCA5ALqbDDXxFmBIUSuRQax")  # $79/yr
+STRIPE_PRICE_LIFETIME = os.environ.get("STRIPE_PRICE_LIFETIME", "price_1UCA5ALqbDDXxFmBldgZch3Y")  # $199 once
 PORT                     = int(os.environ.get("PORT", 8080))
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -132,7 +128,7 @@ def sb_insert(table, rows):
     except HTTPError as e:
         print(f"[sb_insert] {e.status}: {e.read()}")
 
-WORKER_VERSION = "v16"
+WORKER_VERSION = "v17"
 
 # ── Legal Precision: Plain-Text Sanitizer ────────────────────────────────────
 
@@ -1367,15 +1363,9 @@ def _call_api_once(instructions, input_text, max_tokens, model, provider="groq")
         "max_tokens": max_tokens,
         "temperature": 0.3,
     }).encode()
-    if provider == "qwen":
-        url = QWEN_BASE_URL
-        api_key = QWEN_API_KEY
-    elif provider == "mistral":
+    if provider == "mistral":
         url = MISTRAL_BASE_URL
         api_key = MISTRAL_API_KEY
-    elif provider == "poolside":
-        url = POOLSIDE_BASE_URL
-        api_key = POOLSIDE_API_KEY
     elif provider == "cerebras":
         url = "https://api.cerebras.ai/v1/chat/completions"
         api_key = CEREBRAS_API_KEY
@@ -1446,28 +1436,23 @@ def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
     order with graceful fallback. Staggers parallel calls to avoid rate bursts.
     If _track_model is a list, appends the name of the model that succeeded.
 
-    Chain (when configured): Qwen → Mistral → Cerebras → OpenRouter →
-    Poolside → Groq → Groq-fallback. The first provider to return content wins;
+    Chain (when configured): Mistral → Cerebras → OpenRouter → Groq → Groq-fallback. The first provider to return content wins;
     auth/endpoint failures (4xx) fall through to the next provider immediately."""
     # Build the provider chain: best quality first, known-good fallbacks last.
     chain = []
-    if USE_QWEN:
-        chain.append(("qwen", QWEN_MODEL))
     if USE_MISTRAL:
         chain.append(("mistral", MISTRAL_MODEL))
     if USE_CEREBRAS:
         chain.append(("cerebras", CEREBRAS_MODEL))
     if USE_OPENROUTER:
         chain.append(("openrouter", OPENROUTER_MODEL))
-    if USE_POOLSIDE:
-        chain.append(("poolside", POOLSIDE_MODEL))
     if USE_GROQ:
         chain.append(("groq", GROQ_MODEL))
         chain.append(("groq", GROQ_FALLBACK))
 
     if not chain:
-        raise RuntimeError("No AI API key set — set QWENCLOUD_API_KEY, MISTRAL_API_KEY, "
-                           "CEREBRAS_API_KEY, OPENROUTER_API_KEY, or GROQ_API_KEY")
+        raise RuntimeError("No AI API key set — set MISTRAL_API_KEY, "
+                       "CEREBRAS_API_KEY, OPENROUTER_API_KEY, or GROQ_API_KEY")
 
     # Stagger parallel calls to avoid rate-limit bursts (fast providers 0.3s, Groq 1.5s)
     stagger = 0.3 if AI_PROVIDER not in ("openrouter", "groq") else (0.5 if AI_PROVIDER == "openrouter" else 1.5)
@@ -1500,17 +1485,13 @@ def call_openai(instructions, input_text, max_tokens=2000, _track_model=None):
 
     error_detail = "; ".join(errors) if errors else "No AI providers configured"
     configured = []
-    if USE_QWEN: configured.append("Qwen")
     if USE_MISTRAL: configured.append("Mistral")
     if USE_CEREBRAS: configured.append("Cerebras")
     if USE_OPENROUTER: configured.append("OpenRouter")
-    if USE_POOLSIDE: configured.append("Poolside")
     if USE_GROQ: configured.append("Groq")
     provider_note = f" Configured providers: {', '.join(configured) or 'NONE'}."
     if "daily token limit" in error_detail.lower() or "tokens per day" in error_detail.lower():
         suggestions = []
-        if not USE_QWEN:
-            suggestions.append("Add QWENCLOUD_API_KEY (Qwen via Alibaba MaaS — frontier quality, see .env.example)")
         if not USE_MISTRAL:
             suggestions.append("Add MISTRAL_API_KEY (free tier at console.mistral.ai)")
         if not USE_CEREBRAS:
@@ -2569,6 +2550,150 @@ Be helpful, conversational, and accurate. Reference specific parts of the transc
         return {"error": str(e)}
 
 # ── HTTP Server ───────────────────────────────────────────────────────────────
+
+# ── Stripe: checkout / confirm / webhook ────────────────────────────────────
+def stripe_request(method, path, params=None):
+    body = urlencode(params).encode() if params else b""
+    req = Request(f"https://api.stripe.com{path}", data=body if method == "POST" else None,
+                  method=method, headers={
+                      "Authorization": f"Bearer {STRIPE_SECRET_KEY}",
+                      "Content-Type": "application/x-www-form-urlencoded"})
+    resp = urlopen(req, timeout=30)
+    return json.loads(resp.read())
+
+def handle_stripe_checkout(payload):
+    if not STRIPE_SECRET_KEY:
+        return {"error": "Stripe not configured (STRIPE_SECRET_KEY not set on the worker)"}
+    plan = (payload.get("plan") or "monthly").lower()
+    user_id = payload.get("userId") or payload.get("user_id")
+    origin = payload.get("origin")
+    if not user_id or not origin:
+        return {"error": "userId and origin required"}
+    prices = {"monthly":  (STRIPE_PRICE_MONTHLY,  "subscription"),
+              "yearly":   (STRIPE_PRICE_YEARLY,   "subscription"),
+              "lifetime": (STRIPE_PRICE_LIFETIME, "payment")}
+    if plan not in prices:
+        return {"error": f"Unknown plan '{plan}' (use monthly | yearly | lifetime)"}
+    price_id, mode = prices[plan]
+    params = {"mode": mode,
+              "line_items[0][price]": price_id,
+              "line_items[0][quantity]": "1",
+              "success_url": f"{origin}/dashboard?upgrade=success&plan={plan}&session_id={{CHECKOUT_SESSION_ID}}",
+              "cancel_url": f"{origin}/dashboard?upgrade=cancelled",
+              "client_reference_id": user_id,
+              "metadata[user_id]": user_id,
+              "metadata[plan]": plan,
+              "allow_promotion_codes": "true"}
+    if mode == "subscription":
+        params["subscription_data[metadata][user_id]"] = user_id
+        params["subscription_data[metadata][plan]"] = plan
+    session = stripe_request("POST", "/v1/checkout/sessions", params)
+    return {"url": session.get("url"), "plan": plan}
+
+def handle_stripe_confirm(session_id):
+    if not STRIPE_SECRET_KEY:
+        return {"paid": False, "error": "Stripe not configured"}
+    session = stripe_request("GET", f"/v1/checkout/sessions/{session_id}")
+    paid = session.get("payment_status") == "paid"
+    return {"paid": paid,
+            "userId": session.get("client_reference_id") or (session.get("metadata") or {}).get("user_id")}
+
+def verify_stripe_signature(payload_bytes, sig_header):
+    if not STRIPE_WEBHOOK_SECRET:
+        return False
+    try:
+        parts = dict(p.split("=", 1) for p in (sig_header or "").split(",") if "=" in p)
+        t, v1 = parts.get("t"), parts.get("v1")
+        if not t or not v1:
+            return False
+        expected = hmac.new(STRIPE_WEBHOOK_SECRET.encode(), f"{t}.".encode() + payload_bytes, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, v1)
+    except Exception:
+        return False
+
+def handle_stripe_webhook(payload_bytes, sig_header):
+    if not STRIPE_WEBHOOK_SECRET:
+        return {"received": False, "error": "STRIPE_WEBHOOK_SECRET not set"}
+    if not verify_stripe_signature(payload_bytes, sig_header):
+        return {"received": False, "error": "invalid signature"}
+    event = json.loads(payload_bytes.decode() or "{}")
+    etype = event.get("type", "")
+    if etype == "checkout.session.completed":
+        sess = (event.get("data") or {}).get("object") or {}
+        uid = sess.get("client_reference_id") or (sess.get("metadata") or {}).get("user_id")
+        if uid:
+            try:
+                sb_patch("profiles", {"id": uid}, {"is_unlimited": True})
+                print(f"[stripe] checkout completed — is_unlimited granted to {uid}")
+            except Exception as e:
+                print(f"[stripe] profile patch failed: {e}")
+    elif etype == "customer.subscription.deleted":
+        sub = (event.get("data") or {}).get("object") or {}
+        uid = (sub.get("metadata") or {}).get("user_id")
+        plan = (sub.get("metadata") or {}).get("plan")
+        if uid and plan != "lifetime":
+            try:
+                sb_patch("profiles", {"id": uid}, {"is_unlimited": False})
+                print(f"[stripe] subscription cancelled — is_unlimited revoked for {uid}")
+            except Exception as e:
+                print(f"[stripe] downgrade patch failed: {e}")
+    elif etype == "invoice.payment_failed":
+        inv = (event.get("data") or {}).get("object") or {}
+        print(f"[stripe] payment failed (invoice {inv.get('id')})")
+    return {"received": True, "type": etype}
+
+# ── Admin /status diagnostics (service-role bearer required) ────────────────
+def _sb_rest(path, method="GET", data=None, prefer=None):
+    headers = {"apikey": SUPABASE_SERVICE_ROLE, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE}",
+               "Content-Type": "application/json"}
+    if prefer: headers["Prefer"] = prefer
+    req = Request(f"{SUPABASE_URL}/rest/v1/{path}", data=json.dumps(data).encode() if data else None,
+                  method=method, headers=headers)
+    return json.loads(urlopen(req, timeout=30).read() or b"null")
+
+def handle_status(bearer):
+    if (bearer or "") != SUPABASE_SERVICE_ROLE:
+        return None
+    out = {"version": WORKER_VERSION, "stripe": bool(STRIPE_SECRET_KEY),
+           "supadata_keys": len(SUPADATA_KEYS), "poller": "running"}
+    try:
+        rows = _sb_rest("analyses?select=status&order=created_at.desc&limit=2000")
+        counts = {}
+        for r in rows:
+            s = r.get("status") or "unknown"
+            counts[s] = counts.get(s, 0) + 1
+        out["db"] = "ok"
+        out["recent_status_counts"] = counts
+    except Exception as e:
+        out["db"] = f"error: {str(e)[:150]}"
+        return out
+    try:
+        out["recent_failures"] = _sb_rest("analyses?status=eq.failed&select=id,error_message,created_at&order=created_at.desc&limit=5")
+    except Exception:
+        out["recent_failures"] = []
+    try:
+        pend = _sb_rest("analyses?status=eq.pending&select=id,created_at&order=created_at.asc&limit=1")
+        out["oldest_pending"] = pend[0] if pend else None
+    except Exception:
+        out["oldest_pending"] = None
+    return out
+
+# ── Pending-analysis poller (webhook-free trigger) ──────────────────────────
+def pending_poller(interval=20):
+    print(f"[poller] watching for pending analyses every {interval}s")
+    while True:
+        try:
+            rows = _sb_rest("analyses?status=eq.pending&order=created_at.asc&limit=3&select=*")
+            for record in rows or []:
+                claimed = _sb_rest(f"analyses?id=eq.{record['id']}&status=eq.pending", method="PATCH",
+                                   data={"status": "processing"}, prefer="return=representation")
+                if claimed:
+                    print(f"[poller] claimed {record['id']} — starting pipeline")
+                    threading.Thread(target=run_pipeline, args=(record,), daemon=True).start()
+        except Exception as e:
+            print(f"[poller] error: {str(e)[:150]}")
+        time.sleep(interval)
+
 class Handler(BaseHTTPRequestHandler):
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -2633,6 +2758,33 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(result, indent=2).encode())
             return
+        # ── Stripe: verify a completed checkout session ──
+        if path == "/stripe/confirm":
+            from urllib.parse import parse_qs, urlparse
+            session_id = (parse_qs(urlparse(self.path).query).get("session_id") or [""])[0]
+            try:
+                result = handle_stripe_confirm(session_id)
+            except Exception as e:
+                result = {"paid": False, "error": str(e)[:200]}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+        # ── Admin status diagnostics (service-role bearer required) ──
+        if path == "/status":
+            result = handle_status(self.headers.get("Authorization", "").replace("Bearer ", ""))
+            code = 200 if result else 401
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            if result:
+                self.wfile.write(json.dumps(result, indent=2).encode())
+            else:
+                self.wfile.write(b'{"error":"unauthorized"}')
+            return
         supadata = f"{len(SUPADATA_KEYS)} keys" if SUPADATA_KEYS else "no"
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -2640,20 +2792,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         # Report the full provider chain in quality-priority order
         _chain_parts = []
-        if USE_QWEN:     _chain_parts.append(f"qwen ({QWEN_MODEL})")
         if USE_MISTRAL:  _chain_parts.append(f"mistral ({MISTRAL_MODEL})")
         if USE_CEREBRAS: _chain_parts.append(f"cerebras ({CEREBRAS_MODEL})")
         if USE_OPENROUTER: _chain_parts.append(f"openrouter ({OPENROUTER_MODEL})")
-        if USE_POOLSIDE: _chain_parts.append(f"poolside ({POOLSIDE_MODEL})")
         if USE_GROQ:     _chain_parts.append(f"groq ({GROQ_MODEL}/{GROQ_FALLBACK})")
         ai_chain = " → ".join(_chain_parts) if _chain_parts else "none"
         ai_primary = _chain_parts[0] if _chain_parts else "none"
         ai_fallback = " → ".join(_chain_parts[1:]) if len(_chain_parts) > 1 else "none"
         providers_detail = []
-        if USE_QWEN:
-            providers_detail.append({"name": "Qwen", "model": QWEN_MODEL, "configured": True})
-        else:
-            providers_detail.append({"name": "Qwen", "configured": False, "hint": "Set QWENCLOUD_API_KEY — frontier quality (see .env.example)"})
         if USE_MISTRAL:
             providers_detail.append({"name": "Mistral", "model": MISTRAL_MODEL, "configured": True})
         else:
@@ -2666,10 +2812,6 @@ class Handler(BaseHTTPRequestHandler):
             providers_detail.append({"name": "OpenRouter", "model": OPENROUTER_MODEL, "configured": True})
         else:
             providers_detail.append({"name": "OpenRouter", "configured": False, "hint": "Free models — set OPENROUTER_API_KEY"})
-        if USE_POOLSIDE:
-            providers_detail.append({"name": "Poolside", "model": POOLSIDE_MODEL, "configured": True})
-        else:
-            providers_detail.append({"name": "Poolside", "configured": False, "hint": "Set POOLSIDE_API_KEY + POOLSIDE_BASE_URL"})
         if USE_GROQ:
             providers_detail.append({"name": "Groq", "model": GROQ_MODEL, "configured": True})
         else:
@@ -2708,6 +2850,29 @@ class Handler(BaseHTTPRequestHandler):
             self._cors_headers()
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
+# ── Stripe: create checkout session ──
+        if path == "/stripe/checkout-session":
+            result = handle_stripe_checkout(payload)
+            if result.get("error"):
+                code = 400 if "required" in result["error"] or "Unknown plan" in result["error"] else 503
+                self.send_response(code)
+            else:
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
+        # ── Stripe: webhook events (signature-verified) ──
+        if path == "/stripe/webhook":
+            sig = self.headers.get("Stripe-Signature", "")
+            result = handle_stripe_webhook(body, sig)
+            self.send_response(200 if result.get("received") else (400 if "signature" in result.get("error", "") else 503))
+            self.send_header("Content-Type", "application/json")
+            self._cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+            return
             return
 
         # ── Search endpoint ──
@@ -2948,16 +3113,13 @@ def handle_export(data):
 
 if __name__ == "__main__":
     _parts = []
-    if USE_QWEN:     _parts.append(f"Qwen({QWEN_MODEL})")
     if USE_MISTRAL:  _parts.append(f"Mistral({MISTRAL_MODEL})")
     if USE_CEREBRAS: _parts.append(f"Cerebras({CEREBRAS_MODEL})")
     if USE_OPENROUTER: _parts.append(f"OpenRouter({OPENROUTER_MODEL})")
-    if USE_POOLSIDE: _parts.append(f"Poolside({POOLSIDE_MODEL})")
     if USE_GROQ:     _parts.append(f"Groq({GROQ_MODEL})")
     ai_chain = " → ".join(_parts) if _parts else "none"
     print(f"[worker] {WORKER_VERSION} — Supadata: {len(SUPADATA_KEYS)} key(s) | Forensic: enabled")
     print(f"[worker] AI chain: {ai_chain}")
-    if POOLSIDE_API_KEY and not POOLSIDE_BASE_URL:
-        print("[worker] NOTE: POOLSIDE_API_KEY set but POOLSIDE_BASE_URL missing — Poolside disabled. Set POOLSIDE_BASE_URL to enable.")
     print(f"[worker] Listening on port {PORT}")
+    threading.Thread(target=pending_poller, daemon=True).start()
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
